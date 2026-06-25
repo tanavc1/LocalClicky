@@ -281,6 +281,19 @@ func runSelfTest() -> Never {
     check("search → google query", bp3.actions.first?.url.contains("search?q=swift") == true)
     let bp4 = BrowserCommandPlanner.plan(for: "open youtube and reddit")
     check("two sites → two actions", bp4.actions.count == 2)
+    let bp5 = BrowserCommandPlanner.plan(for: "go to youtube and go to david dobriks channel")
+    check("youtube channel request → youtube channel search",
+          bp5.actions.count == 1
+          && bp5.actions[0].url.contains("youtube.com/results")
+          && bp5.actions[0].url.contains("david"))
+    let bp6 = BrowserCommandPlanner.plan(for: "search for coffee shops on google maps")
+    check("maps scoped search → maps search url",
+          bp6.actions.first?.url.contains("google.com/maps/search") == true
+          && bp6.actions.first?.url.contains("coffee") == true)
+    let bp7 = BrowserCommandPlanner.plan(for: "open github and search for localclicky")
+    check("github scoped search → github search url",
+          bp7.actions.first?.url.contains("github.com/search") == true
+          && bp7.actions.first?.url.contains("localclicky") == true)
     check("unknown command not understood",
           BrowserCommandPlanner.plan(for: "open the file menu").isUnderstood == false)
 

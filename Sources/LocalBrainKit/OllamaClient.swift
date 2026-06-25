@@ -190,7 +190,10 @@ public final class OllamaClient: @unchecked Sendable {
         let response: URLResponse
         do {
             (byteStream, response) = try await session.bytes(for: request)
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
         } catch {
+            if Task.isCancelled { throw CancellationError() }
             throw OllamaError.serverUnreachable
         }
 
@@ -214,7 +217,7 @@ public final class OllamaClient: @unchecked Sendable {
         var reportedTokensPerSecond: Double?
 
         for try await line in byteStream.lines {
-            if Task.isCancelled { break }
+            try Task.checkCancellation()
             let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmedLine.isEmpty,
                   let lineData = trimmedLine.data(using: .utf8),

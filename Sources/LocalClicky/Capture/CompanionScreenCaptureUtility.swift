@@ -24,10 +24,26 @@ struct CompanionScreenCapture {
 @MainActor
 enum CompanionScreenCaptureUtility {
 
+    /// Captures only the display under the cursor. The response pipeline sends a
+    /// single image to the vision model, so avoiding secondary-display captures
+    /// removes unnecessary ScreenCaptureKit and JPEG work on multi-monitor Macs.
+    static func captureCursorScreenAsJPEG() async throws -> CompanionScreenCapture {
+        let captures = try await captureScreensAsJPEG(cursorScreenOnly: true)
+        guard let cursorCapture = captures.first(where: { $0.isCursorScreen }) ?? captures.first else {
+            throw NSError(domain: "CompanionScreenCapture", code: -2,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to capture the cursor screen"])
+        }
+        return cursorCapture
+    }
+
     /// Captures all connected displays as JPEG data, labeling each with
     /// whether the user's cursor is on that screen. This gives the AI
     /// full context across multiple monitors.
     static func captureAllScreensAsJPEG() async throws -> [CompanionScreenCapture] {
+        try await captureScreensAsJPEG(cursorScreenOnly: false)
+    }
+
+    private static func captureScreensAsJPEG(cursorScreenOnly: Bool) async throws -> [CompanionScreenCapture] {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
 
         guard !content.displays.isEmpty else {
@@ -69,7 +85,9 @@ enum CompanionScreenCaptureUtility {
 
         var capturedScreens: [CompanionScreenCapture] = []
 
-        for (displayIndex, display) in sortedDisplays.enumerated() {
+        let displaysToCapture = cursorScreenOnly ? Array(sortedDisplays.prefix(1)) : sortedDisplays
+
+        for (displayIndex, display) in displaysToCapture.enumerated() {
             // Use NSScreen.frame (AppKit coordinates, bottom-left origin) so
             // displayFrame is in the same coordinate system as NSEvent.mouseLocation
             // and the overlay window's screenFrame in BlueCursorView.
@@ -81,7 +99,7 @@ enum CompanionScreenCaptureUtility {
             let filter = SCContentFilter(display: display, excludingWindows: ownAppWindows)
 
             let configuration = SCStreamConfiguration()
-            let maxDimension = 1280
+            let maxDimension = 1152
             let aspectRatio = CGFloat(display.width) / CGFloat(display.height)
             if display.width >= display.height {
                 configuration.width = maxDimension

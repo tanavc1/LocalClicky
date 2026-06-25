@@ -89,6 +89,10 @@ public enum BrowserCommandPlanner {
                 spokenSummary: "sure, opening gmail and starting a new draft for you.")
         }
 
+        if let sitePlan = siteSpecificPlan(for: text) {
+            return sitePlan
+        }
+
         var actions: [BrowserAction] = []
         var labels: [String] = []
 
@@ -159,6 +163,175 @@ public enum BrowserCommandPlanner {
             }
         }
         return nil
+    }
+
+    static func siteSpecificPlan(for text: String) -> BrowserPlan? {
+        if let query = youtubeChannelQuery(in: text) {
+            return BrowserPlan(
+                actions: [BrowserAction(
+                    url: youtubeSearchURL(query: "\(query) channel"),
+                    label: "youtube channel search for \(query)"
+                )],
+                spokenSummary: "sure, opening youtube results for \(query)'s channel.")
+        }
+
+        if let query = siteSearchQuery(in: text, siteNames: ["youtube"]) {
+            return BrowserPlan(
+                actions: [BrowserAction(url: youtubeSearchURL(query: query), label: "youtube search for \(query)")],
+                spokenSummary: "sure, searching youtube for \(query).")
+        }
+
+        if let query = siteSearchQuery(in: text, siteNames: ["google maps", "maps"]) {
+            return BrowserPlan(
+                actions: [BrowserAction(url: googleMapsSearchURL(query: query), label: "maps search for \(query)")],
+                spokenSummary: "sure, opening maps for \(query).")
+        }
+
+        if let query = siteSearchQuery(in: text, siteNames: ["github"]) {
+            return BrowserPlan(
+                actions: [BrowserAction(url: githubSearchURL(query: query), label: "github search for \(query)")],
+                spokenSummary: "sure, searching github for \(query).")
+        }
+
+        if let query = siteSearchQuery(in: text, siteNames: ["reddit"]) {
+            return BrowserPlan(
+                actions: [BrowserAction(url: redditSearchURL(query: query), label: "reddit search for \(query)")],
+                spokenSummary: "sure, searching reddit for \(query).")
+        }
+
+        if let query = siteSearchQuery(in: text, siteNames: ["amazon"]) {
+            return BrowserPlan(
+                actions: [BrowserAction(url: amazonSearchURL(query: query), label: "amazon search for \(query)")],
+                spokenSummary: "sure, searching amazon for \(query).")
+        }
+
+        if let query = siteSearchQuery(in: text, siteNames: ["wikipedia"]) {
+            return BrowserPlan(
+                actions: [BrowserAction(url: wikipediaSearchURL(query: query), label: "wikipedia search for \(query)")],
+                spokenSummary: "sure, searching wikipedia for \(query).")
+        }
+
+        if let query = siteSearchQuery(in: text, siteNames: ["gmail", "mail"]) {
+            return BrowserPlan(
+                actions: [BrowserAction(url: gmailSearchURL(query: query), label: "gmail search for \(query)")],
+                spokenSummary: "sure, searching gmail for \(query).")
+        }
+
+        return nil
+    }
+
+    static func youtubeChannelQuery(in text: String) -> String? {
+        guard text.contains("youtube"), text.contains("channel") else { return nil }
+        return siteSearchQuery(in: text, siteNames: ["youtube"], trailingWordsToDrop: ["channel"])
+    }
+
+    static func siteSearchQuery(
+        in text: String,
+        siteNames: [String],
+        trailingWordsToDrop: [String] = []
+    ) -> String? {
+        guard let siteRange = siteNames.compactMap({ text.range(of: $0) }).min(by: { $0.lowerBound < $1.lowerBound }) else {
+            return nil
+        }
+
+        let afterSite = String(text[siteRange.upperBound...])
+        let beforeSite = String(text[..<siteRange.lowerBound])
+        let candidates = [
+            queryAfterSiteConnector(afterSite, trailingWordsToDrop: trailingWordsToDrop),
+            queryBeforeSiteConnector(beforeSite, trailingWordsToDrop: trailingWordsToDrop),
+        ]
+        return candidates.compactMap { $0 }.first
+    }
+
+    static func queryAfterSiteConnector(_ text: String, trailingWordsToDrop: [String]) -> String? {
+        let connectors = [
+            " and go to ", " and open ", " and search for ", " and search ",
+            " then go to ", " then open ", " then search for ", " then search ",
+            " go to ", " open ", " search for ", " search ", " find ",
+            " look up ", " pull up ", " take me to "
+        ]
+        for connector in connectors where text.contains(connector) {
+            guard let range = text.range(of: connector) else { continue }
+            let raw = String(text[range.upperBound...])
+            if let query = cleanedSiteQuery(raw, trailingWordsToDrop: trailingWordsToDrop) {
+                return query
+            }
+        }
+        return nil
+    }
+
+    static func queryBeforeSiteConnector(_ text: String, trailingWordsToDrop: [String]) -> String? {
+        let connectors = ["search for ", "search ", "find ", "look up ", "open ", "go to ",
+                          " search for ", " search ", " find ", " look up ", " open ", " go to "]
+        for connector in connectors where text.contains(connector) {
+            guard let range = text.range(of: connector) else { continue }
+            var raw = String(text[range.upperBound...])
+            if raw.contains(" and ") { continue }
+            for suffix in [" on ", " in ", " at "] {
+                if let suffixRange = raw.range(of: suffix, options: .backwards) {
+                    raw = String(raw[..<suffixRange.lowerBound])
+                    break
+                }
+            }
+            if let query = cleanedSiteQuery(raw, trailingWordsToDrop: trailingWordsToDrop) {
+                return query
+            }
+        }
+        return nil
+    }
+
+    static func cleanedSiteQuery(_ raw: String, trailingWordsToDrop: [String]) -> String? {
+        var query = raw
+        for stopPhrase in [" and then ", " then ", " after that "] {
+            if let range = query.range(of: stopPhrase) {
+                query = String(query[..<range.lowerBound])
+            }
+        }
+        query = query.replacingOccurrences(of: " my ", with: " ")
+            .replacingOccurrences(of: " the ", with: " ")
+            .replacingOccurrences(of: " a ", with: " ")
+            .replacingOccurrences(of: " an ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        for word in trailingWordsToDrop {
+            if query == word { return nil }
+            if query.hasSuffix(" \(word)") {
+                query = String(query.dropLast(word.count + 1))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return query.isEmpty ? nil : query
+    }
+
+    static func encodedQuery(_ query: String) -> String {
+        query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+    }
+
+    static func youtubeSearchURL(query: String) -> String {
+        "https://www.youtube.com/results?search_query=\(encodedQuery(query))"
+    }
+
+    static func googleMapsSearchURL(query: String) -> String {
+        "https://www.google.com/maps/search/?api=1&query=\(encodedQuery(query))"
+    }
+
+    static func githubSearchURL(query: String) -> String {
+        "https://github.com/search?q=\(encodedQuery(query))"
+    }
+
+    static func redditSearchURL(query: String) -> String {
+        "https://www.reddit.com/search/?q=\(encodedQuery(query))"
+    }
+
+    static func amazonSearchURL(query: String) -> String {
+        "https://www.amazon.com/s?k=\(encodedQuery(query))"
+    }
+
+    static func wikipediaSearchURL(query: String) -> String {
+        "https://en.wikipedia.org/w/index.php?search=\(encodedQuery(query))"
+    }
+
+    static func gmailSearchURL(query: String) -> String {
+        "https://mail.google.com/mail/u/0/#search/\(encodedQuery(query))"
     }
 
     static func explicitURL(in text: String) -> String? {

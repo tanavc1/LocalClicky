@@ -108,6 +108,7 @@ final class CompanionManager: ObservableObject {
     /// The currently running AI response task, if any. Cancelled when the user
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
+    private var currentResponseIdentifier: UUID?
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
@@ -205,11 +206,13 @@ final class CompanionManager: ObservableObject {
     private func warmUpLocalModels() {
         Task.detached(priority: .utility) { [ollamaClient] in
             for model in LocalModels.requiredModels {
+                let contextWindow = model == LocalModels.chatModel ? 4096 : 8192
                 _ = try? await ollamaClient.streamChat(
                     model: model,
                     messages: [.user("hi")],
                     temperature: 0.0,
                     maxTokens: 1,
+                    contextWindow: contextWindow,
                     onText: { _ in }
                 )
             }
@@ -479,6 +482,8 @@ final class CompanionManager: ObservableObject {
             NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
             currentResponseTask?.cancel()
+            currentResponseTask = nil
+            currentResponseIdentifier = nil
             speechSynthesizer.stopPlayback()
             clearDetectedElementLocation()
             lastResponseLatencyDescription = nil
@@ -520,10 +525,20 @@ final class CompanionManager: ObservableObject {
     /// returned a [POINT:x,y] tag — flies the blue cursor to that element.
     private func sendTranscriptToLocalModel(transcript: String) {
         currentResponseTask?.cancel()
+        currentResponseTask = nil
+        currentResponseIdentifier = nil
         speechSynthesizer.stopPlayback()
 
+        let responseIdentifier = UUID()
+        currentResponseIdentifier = responseIdentifier
         currentResponseTask = Task {
             voiceState = .processing
+            defer {
+                if currentResponseIdentifier == responseIdentifier {
+                    currentResponseTask = nil
+                    currentResponseIdentifier = nil
+                }
+            }
 
             do {
                 // Route this turn. The router decides screen vs text vs browser
@@ -558,8 +573,7 @@ final class CompanionManager: ObservableObject {
                 var userImagesBase64: [String] = []
                 let model: String
 
-                if useScreen, let capture = try? await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-                    .first(where: { $0.isCursorScreen }) {
+                if useScreen, let capture = try? await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG() {
                     cursorScreenCapture = capture
                     userImagesBase64 = [capture.imageData.base64EncodedString()]
                     systemPrompt = LocalPrompts.screenVoiceResponse(
@@ -604,7 +618,8 @@ final class CompanionManager: ObservableObject {
                     model: model,
                     messages: messages,
                     temperature: cursorScreenCapture == nil ? 0.7 : 0.3,
-                    maxTokens: 512,
+                    maxTokens: cursorScreenCapture == nil ? 220 : 180,
+                    contextWindow: cursorScreenCapture == nil ? 4096 : 8192,
                     onText: { accumulated in
                         let speakable = SpokenTextSegmenter.speakablePrefix(accumulated)
                         if let (sentence, _) = speechProgress.advance(speakable: speakable) {
@@ -658,6 +673,10 @@ final class CompanionManager: ObservableObject {
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted.
+                if !buddyDictationManager.isDictationInProgress {
+                    voiceState = .idle
+                    scheduleTransientHideIfNeeded()
+                }
             } catch let error as OllamaError {
                 print("⚠️ Local model error: \(error.localizedDescription)")
                 refreshLocalEngineStatus()
