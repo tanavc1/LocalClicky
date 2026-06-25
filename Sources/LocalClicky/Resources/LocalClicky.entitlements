@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Not sandboxed: the app needs Accessibility (global hot key) and
+	     Screen Recording, which the sandbox doesn't grant. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<!-- Talk to the local Ollama server on 127.0.0.1. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- Microphone for push-to-talk. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<!-- ScreenCaptureKit content picker. -->
+	<key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+	<array>
+		<string>com.apple.screencapturekit.picker</string>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,17 @@
+# SwiftPM build output
+.build/
+.swiftpm/
+
+# Packaged app + DMG output
+dist/
+
+# Vendored neural TTS runtime + Piper voice (~108MB of third-party binaries).
+# Reproduce locally with scripts/fetch-tts.sh — not committed to keep the repo small.
+vendor/
+
+# macOS
+.DS_Store
+*.xcuserstate
+
+# Editor / agent
+.claude/

@@ -1,0 +1,379 @@
+//
+//  localbrain-harness
+//
+//  A command-line harness that exercises LocalClicky's entire local inference
+//  pipeline end-to-end against the real Ollama models — no GUI, no mic, no
+//  screen permissions needed. This is how we verify the "brain" actually works:
+//  text chat, screen vision Q&A, and UI-element pointing (the coordinates that
+//  drive the blue cursor).
+//
+//  Usage:
+//    localbrain-harness                         # health + text chat only
+//    localbrain-harness <image.png>             # + vision Q&A + pointing
+//    localbrain-harness <image.png> "question"  # custom screen question
+//
+
+import Foundation
+import LocalBrainKit
+
+func loadImageBase64(_ path: String) -> String? {
+    guard let data = FileManager.default.contents(atPath: path) else { return nil }
+    return data.base64EncodedString()
+}
+
+func fmt(_ value: TimeInterval?) -> String {
+    guard let value else { return "n/a" }
+    return String(format: "%.2fs", value)
+}
+
+/// Reads pixel dimensions from a PNG header without decoding the whole image.
+func pngPixelSize(path: String) -> (Int, Int)? {
+    guard let data = FileManager.default.contents(atPath: path) else { return nil }
+    let bytes = [UInt8](data)
+    guard bytes.count > 24, bytes[0] == 0x89, bytes[1] == 0x50 else { return nil }
+    let width = Int(bytes[16]) << 24 | Int(bytes[17]) << 16 | Int(bytes[18]) << 8 | Int(bytes[19])
+    let height = Int(bytes[20]) << 24 | Int(bytes[21]) << 16 | Int(bytes[22]) << 8 | Int(bytes[23])
+    return (width, height)
+}
+
+import CoreGraphics
+import ImageIO
+import AppKit
+
+// MARK: - Benchmark support
+
+/// Simple latency accumulator. We report the mean of the *warm* runs (the first
+/// run is discarded so the model-load cost doesn't pollute the steady-state
+/// number the user actually feels question-to-question).
+private struct LatencySamples {
+    var firstToken: [TimeInterval] = []
+    var total: [TimeInterval] = []
+    var tokensPerSecond: [Double] = []
+
+    mutating func record(_ result: OllamaChatResult) {
+        if let ft = result.firstTokenLatencySeconds { firstToken.append(ft) }
+        total.append(result.totalDurationSeconds)
+        if let tps = result.tokensPerSecond { tokensPerSecond.append(tps) }
+    }
+
+    private func mean(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.reduce(0, +) / Double(xs.count) }
+    var meanFirstToken: TimeInterval { mean(firstToken) }
+    var meanTotal: TimeInterval { mean(total) }
+    var meanTokensPerSecond: Double { mean(tokensPerSecond) }
+}
+
+/// Mutable holder so the @Sendable streaming callback can record when the first
+/// complete spoken sentence becomes available.
+private final class FirstSentenceTimer: @unchecked Sendable {
+    let start = Date()
+    var firstSentenceAt: TimeInterval?
+    var spokenLength = 0
+}
+
+/// Downscales encoded image data to a target long edge and re-encodes as JPEG,
+/// returning the bytes plus the new pixel dimensions. Used by the image-size
+/// sweep so we can measure how prefill latency trades against the resolution the
+/// vision model actually sees. Mirrors the app's capture (JPEG, q0.8).
+private func resizedJPEG(from data: Data, longEdge: Int, compression: CGFloat = 0.8) -> (data: Data, width: Int, height: Int)? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+    let width = cgImage.width, height = cgImage.height
+    let scale = Double(longEdge) / Double(max(width, height))
+    let newWidth = max(1, Int(Double(width) * scale))
+    let newHeight = max(1, Int(Double(height) * scale))
+    guard let context = CGContext(
+        data: nil, width: newWidth, height: newHeight, bitsPerComponent: 8, bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return nil }
+    context.interpolationQuality = .high
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
+    guard let scaled = context.makeImage(),
+          let jpeg = NSBitmapImageRep(cgImage: scaled)
+            .representation(using: .jpeg, properties: [.compressionFactor: compression]) else { return nil }
+    return (jpeg, newWidth, newHeight)
+}
+
+/// Runs the same kind of requests the app makes and prints averaged latency, so
+/// we can prove before/after the latency work. Discards a warm-up run for each
+/// configuration.
+///   localbrain-harness --benchmark [image.png] [iterations]
+func runBenchmark(imagePath: String?, iterations: Int) async {
+    let client = OllamaClient()
+    print("=== LocalClicky latency benchmark (\(iterations) warm runs each) ===")
+    guard await client.isServerReachable() else {
+        print("❌ Ollama not reachable on \(client.baseURL). Start it: ollama serve")
+        exit(1)
+    }
+
+    // --- Text chat ---
+    print("\n--- text chat (\(LocalModels.chatModel)) ---")
+    let textPrompt = "what's 12 times 8? answer in one short sentence."
+    do {
+        // warm-up (discarded)
+        _ = try await client.streamChat(model: LocalModels.chatModel,
+            messages: [.system(LocalPrompts.textVoiceResponse), .user(textPrompt)],
+            temperature: 0.2, maxTokens: 80, onText: { _ in })
+        var samples = LatencySamples()
+        for _ in 0..<iterations {
+            let result = try await client.streamChat(model: LocalModels.chatModel,
+                messages: [.system(LocalPrompts.textVoiceResponse), .user(textPrompt)],
+                temperature: 0.2, maxTokens: 80, onText: { _ in })
+            samples.record(result)
+        }
+        print(String(format: "  first-token %.2fs | total %.2fs | %.0f tok/s",
+                     samples.meanFirstToken, samples.meanTotal, samples.meanTokensPerSecond))
+    } catch {
+        print("  ❌ text chat failed: \(error.localizedDescription)")
+    }
+
+    // --- Perceived speech latency: when can the companion START talking? ---
+    // The old pipeline waited for the FULL answer before speaking; the new one
+    // speaks the first sentence as soon as it's complete. Both are measured here
+    // from one streamed response.
+    print("\n--- perceived speech latency (text answer, when speech can begin) ---")
+    do {
+        let timer = FirstSentenceTimer()
+        let result = try await client.streamChat(
+            model: LocalModels.chatModel,
+            messages: [.system(LocalPrompts.textVoiceResponse),
+                       .user("explain what git is, in two short sentences.")],
+            temperature: 0.3, maxTokens: 120,
+            onText: { accumulated in
+                guard timer.firstSentenceAt == nil else { return }
+                let speakable = SpokenTextSegmenter.speakablePrefix(accumulated)
+                if let next = SpokenTextSegmenter.nextCompleteSentences(
+                    speakable: speakable, alreadySpoken: timer.spokenLength) {
+                    timer.spokenLength = next.newSpokenLength
+                    timer.firstSentenceAt = Date().timeIntervalSince(timer.start)
+                }
+            })
+        let full = result.totalDurationSeconds
+        let first = timer.firstSentenceAt ?? full
+        print(String(format: "  new: start talking at first sentence  %.2fs", first))
+        print(String(format: "  old: waited for full answer           %.2fs", full))
+        print(String(format: "  → speech begins %.2fs sooner (%.0f%%)", full - first,
+                     full > 0 ? (full - first) / full * 100 : 0))
+    } catch {
+        print("  ❌ perceived-latency test failed: \(error.localizedDescription)")
+    }
+
+    // --- Vision Q&A + image-size sweep ---
+    guard let imagePath, let rawData = FileManager.default.contents(atPath: imagePath) else {
+        print("\n(no image given — skipping vision sweep. Pass a screenshot path to benchmark vision.)")
+        return
+    }
+    let question = "where do i click to open settings?"
+    func pad(_ s: String, _ width: Int) -> String {
+        s.count >= width ? s : s + String(repeating: " ", count: width - s.count)
+    }
+    print("\n--- vision (\(LocalModels.visionModel)) on \(imagePath) — image long-edge sweep ---")
+    print("  " + pad("size", 12) + pad("bytes(KB)", 11) + pad("first-token", 13) + pad("total", 12) + "pointed?")
+    for longEdge in [1280, 1100, 1024, 896] {
+        guard let resized = resizedJPEG(from: rawData, longEdge: longEdge) else {
+            print("  \(longEdge): resize failed"); continue
+        }
+        let base64 = resized.data.base64EncodedString()
+        let systemPrompt = LocalPrompts.screenVoiceResponse(
+            imageWidthInPixels: resized.width, imageHeightInPixels: resized.height)
+        do {
+            _ = try await client.streamChat(model: LocalModels.visionModel,
+                messages: [.system(systemPrompt), .user(question, imagesBase64: [base64])],
+                temperature: 0.2, maxTokens: 160, onText: { _ in })
+            var samples = LatencySamples()
+            var pointedCount = 0
+            for _ in 0..<iterations {
+                let result = try await client.streamChat(model: LocalModels.visionModel,
+                    messages: [.system(systemPrompt), .user(question, imagesBase64: [base64])],
+                    temperature: 0.2, maxTokens: 160, onText: { _ in })
+                samples.record(result)
+                if PointingTagParser.parse(from: result.text).hasPoint { pointedCount += 1 }
+            }
+            let label = "\(resized.width)x\(resized.height)"
+            print("  " + pad(label, 12) + pad("\(resized.data.count / 1024)", 11)
+                  + pad(String(format: "%.2fs", samples.meanFirstToken), 13)
+                  + pad(String(format: "%.2fs", samples.meanTotal), 12)
+                  + "\(pointedCount)/\(iterations)")
+        } catch {
+            print("  \(longEdge): ❌ \(error.localizedDescription)")
+        }
+    }
+}
+
+/// Dependency-free assertion runner so the pointing-tag parser can be verified
+/// on a Command-Line-Tools-only machine (XCTest needs full Xcode).
+func runSelfTest() -> Never {
+    var failures = 0
+    func check(_ name: String, _ condition: Bool) {
+        print((condition ? "✅ " : "❌ ") + name)
+        if !condition { failures += 1 }
+    }
+
+    let t1 = PointingTagParser.parse(from: "you'll want the color inspector. [POINT:1100,42:color inspector]")
+    check("classic [POINT:x,y:label]", t1.centerInImagePixels == CGPoint(x: 1100, y: 42)
+          && t1.label == "color inspector" && t1.spokenText == "you'll want the color inspector.")
+
+    let t2 = PointingTagParser.parse(from: "that's on your other monitor. [POINT:400,300:terminal:screen2]")
+    check("screen number suffix", t2.centerInImagePixels == CGPoint(x: 400, y: 300)
+          && t2.label == "terminal" && t2.screenNumber == 2)
+
+    let t3 = PointingTagParser.parse(from: "html is the skeleton. [POINT:none]")
+    check("[POINT:none] → no point", !t3.hasPoint && t3.spokenText == "html is the skeleton.")
+
+    let t4 = PointingTagParser.parse(from: "click record. [POINT:932,415,978,436:rec]")
+    check("box inside POINT → center", t4.centerInImagePixels == CGPoint(x: 955, y: 425.5) && t4.label == "rec")
+
+    let t5 = PointingTagParser.parse(from: "here it is [589,714,692,750:Export]")
+    check("bare box fallback → center", t5.centerInImagePixels == CGPoint(x: 640.5, y: 732)
+          && t5.label == "Export" && t5.spokenText == "here it is")
+
+    let t6 = PointingTagParser.parse(from: "just a normal answer with no pointing")
+    check("no tag → whole text", !t6.hasPoint && t6.spokenText == "just a normal answer with no pointing")
+
+    let t7 = PointingTagParser.parse(from: "look here [POINT:10,20:a] and final [POINT:30,40:b]")
+    check("multiple tags: last wins, all stripped", t7.centerInImagePixels == CGPoint(x: 30, y: 40)
+          && !t7.spokenText.contains("POINT"))
+
+    // --- ConversationRouter ---
+    // Default daily context: vision mode on, screen available.
+    func ctx(prevScreen: Bool = false, history: Bool = false,
+             vision: Bool = true, screen: Bool = true) -> ConversationRouter.Context {
+        .init(visionModeSelected: vision, screenAvailable: screen,
+              previousTurnUsedScreen: prevScreen, hasConversationHistory: history)
+    }
+    func route(_ s: String, _ c: ConversationRouter.Context) -> ConversationRoute {
+        ConversationRouter.route(transcript: s, context: c)
+    }
+    check("math → text", route("what's 3 times 5", ctx()) == .text)
+    check("math follow-up → text", route("add 2 to that", ctx(prevScreen: false, history: true)) == .text)
+    check("general knowledge → text", route("what's the capital of france", ctx()) == .text)
+    check("screen 'where do i click' → screen", route("where do i click to start recording", ctx()) == .screen)
+    check("screen 'this button' → screen", route("what does this button do", ctx()) == .screen)
+    check("screen 'explain this error' → screen", route("explain this error", ctx()) == .screen)
+    check("browser new tab → browserCommand", route("open a new tab and go to gmail", ctx()) == .browserCommand)
+    check("browser gmail draft → browserCommand", route("go to my gmail and open up a draft", ctx()) == .browserCommand)
+    check("browser works in text mode", route("open youtube", ctx(vision: false)) == .browserCommand)
+    check("'open the file menu' is NOT browser", route("open the file menu", ctx()) == .screen)
+    check("text mode never screens", route("what's on my screen", ctx(vision: false)) == .text)
+    check("no screen permission falls back to text", route("where do i click", ctx(screen: false)) == .text)
+
+    // --- SpokenTextSegmenter (streaming TTS) ---
+    check("speakablePrefix cuts at pointing tag",
+          SpokenTextSegmenter.speakablePrefix("you'll want the toolbar. [POINT:10,20:x]") == "you'll want the toolbar. ")
+    check("speakablePrefix passes plain text",
+          SpokenTextSegmenter.speakablePrefix("just a normal answer") == "just a normal answer")
+    let seg1 = SpokenTextSegmenter.nextCompleteSentences(speakable: "you'll find it up top. it's blue", alreadySpoken: 0)
+    check("first complete sentence emitted", seg1?.text == "you'll find it up top.")
+    check("partial trailing sentence withheld",
+          SpokenTextSegmenter.nextCompleteSentences(speakable: "it's blue", alreadySpoken: 0) == nil)
+    check("decimal not split mid-stream",
+          SpokenTextSegmenter.nextCompleteSentences(speakable: "the answer is 3.5 meters", alreadySpoken: 0) == nil)
+    let seg2 = SpokenTextSegmenter.nextCompleteSentences(speakable: "the answer is 3.5 meters. ", alreadySpoken: 0)
+    check("decimal intact when sentence completes", seg2?.text == "the answer is 3.5 meters.")
+    check("remainder returns final sentence",
+          SpokenTextSegmenter.remainder(speakable: "all done now", alreadySpoken: 0) == "all done now")
+
+    // --- BrowserCommandPlanner ---
+    let bp1 = BrowserCommandPlanner.plan(for: "open a new tab, go to my gmail, and open up a draft")
+    check("gmail draft → compose url", bp1.actions.count == 1 && bp1.actions[0].url.contains("view=cm"))
+    let bp2 = BrowserCommandPlanner.plan(for: "open gmail")
+    check("open gmail → inbox url", bp2.actions.first?.url == "https://mail.google.com/mail/u/0/")
+    let bp3 = BrowserCommandPlanner.plan(for: "search for swift concurrency")
+    check("search → google query", bp3.actions.first?.url.contains("search?q=swift") == true)
+    let bp4 = BrowserCommandPlanner.plan(for: "open youtube and reddit")
+    check("two sites → two actions", bp4.actions.count == 2)
+    check("unknown command not understood",
+          BrowserCommandPlanner.plan(for: "open the file menu").isUnderstood == false)
+
+    print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
+    exit(failures == 0 ? 0 : 1)
+}
+
+func runHarness() async {
+    let arguments = Array(CommandLine.arguments.dropFirst())
+    if arguments.first == "--selftest" { runSelfTest() }
+    if arguments.first == "--benchmark" {
+        let benchImage = arguments.count >= 2 ? arguments[1] : nil
+        let iterations = arguments.count >= 3 ? (Int(arguments[2]) ?? 3) : 3
+        await runBenchmark(imagePath: benchImage, iterations: iterations)
+        return
+    }
+    let imagePath = arguments.first
+    let customQuestion = arguments.count >= 2 ? arguments[1] : nil
+
+    let client = OllamaClient()
+    print("=== LocalClicky brain harness ===")
+
+    // 1) Health
+    guard await client.isServerReachable() else {
+        print("❌ Ollama not reachable on \(client.baseURL). Start it with: ollama serve")
+        exit(1)
+    }
+    print("✅ Ollama reachable at \(client.baseURL)")
+    do {
+        let missing = try await client.missingRequiredModels()
+        if missing.isEmpty {
+            print("✅ Required models installed: \(LocalModels.requiredModels.joined(separator: ", "))")
+        } else {
+            print("⚠️  Missing models: \(missing.joined(separator: ", "))")
+        }
+    } catch {
+        print("⚠️  Could not list models: \(error.localizedDescription)")
+    }
+
+    // 2) Text chat (fast model)
+    print("\n--- text chat (\(LocalModels.chatModel)) ---")
+    do {
+        let result = try await client.streamChat(
+            model: LocalModels.chatModel,
+            messages: [
+                .system(LocalPrompts.textVoiceResponse),
+                .user("what does git rebase actually do? keep it short."),
+            ],
+            temperature: 0.7, maxTokens: 200, onText: { _ in }
+        )
+        print("first token: \(fmt(result.firstTokenLatencySeconds)) | total: \(fmt(result.totalDurationSeconds)) | " +
+              "\(result.tokensPerSecond.map { String(format: "%.0f tok/s", $0) } ?? "n/a")")
+        print("answer: \"\(result.text)\"")
+    } catch {
+        print("❌ text chat failed: \(error.localizedDescription)")
+    }
+
+    // 3) Vision Q&A + pointing
+    guard let imagePath else {
+        print("\n(no image given — skipping vision test. Pass an image path to test screen vision + pointing.)")
+        return
+    }
+    guard let imageBase64 = loadImageBase64(imagePath) else {
+        print("\n❌ couldn't read image at \(imagePath)")
+        exit(1)
+    }
+    let (imageWidth, imageHeight) = pngPixelSize(path: imagePath) ?? (1280, 800)
+    let question = customQuestion ?? "where do i click to start recording?"
+
+    print("\n--- screen vision + pointing (\(LocalModels.visionModel)) on \(imagePath) [\(imageWidth)x\(imageHeight)] ---")
+    print("question: \"\(question)\"")
+    do {
+        let result = try await client.streamChat(
+            model: LocalModels.visionModel,
+            messages: [
+                .system(LocalPrompts.screenVoiceResponse(imageWidthInPixels: imageWidth, imageHeightInPixels: imageHeight)),
+                .user(question, imagesBase64: [imageBase64]),
+            ],
+            temperature: 0.2, maxTokens: 200, onText: { _ in }
+        )
+        print("first token: \(fmt(result.firstTokenLatencySeconds)) | total: \(fmt(result.totalDurationSeconds))")
+        print("raw model output: \"\(result.text)\"")
+        let pointing = PointingTagParser.parse(from: result.text)
+        print("spoken text: \"\(pointing.spokenText)\"")
+        if let center = pointing.centerInImagePixels {
+            print("➡️  POINT center: (\(Int(center.x)), \(Int(center.y)))  label: \(pointing.label ?? "—")" +
+                  (pointing.screenNumber.map { "  screen: \($0)" } ?? ""))
+        } else {
+            print("➡️  no point (\(pointing.label ?? "none"))")
+        }
+    } catch {
+        print("❌ vision test failed: \(error.localizedDescription)")
+    }
+}
+
+await runHarness()
