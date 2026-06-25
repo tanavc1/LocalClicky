@@ -204,6 +204,25 @@ enum BuddyDictationPermissionProblem {
     case speechRecognitionDenied
 }
 
+enum BuddyDictationError: LocalizedError {
+    /// The shared audio engine wasn't in a usable state when we tried to start
+    /// recording — typically the input node reported an invalid format (0 Hz /
+    /// 0 channels) because the audio hardware was still settling, often right
+    /// after we'd just played a spoken response. Recoverable: the next attempt
+    /// usually succeeds once the device is ready. We surface this as a normal
+    /// Swift error specifically so it can be caught and recovered from, instead
+    /// of letting AVAudioEngine raise an uncatchable Objective-C exception that
+    /// would crash the whole app.
+    case microphoneUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .microphoneUnavailable:
+            return "couldn't start the microphone. try again."
+        }
+    }
+}
+
 private enum BuddyDictationStartSource {
     case microphoneButton
     case keyboardShortcut
@@ -546,10 +565,34 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.activeTranscriptionSession = activeTranscriptionSession
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
+        // The audio engine is shared across push-to-talk sessions and lives right
+        // next to the AVAudioPlayer that speaks answers. Two states are dangerous:
+        // a previous session that left the engine running, and the audio HAL still
+        // reconfiguring after we just spoke a response — in the latter the input
+        // node hands back a stale/invalid format (0 Hz or 0 channels). Calling
+        // installTap(...) or start() in either state raises an Objective-C
+        // exception that Swift do/catch CANNOT catch, which crashes the whole app.
+        // That is the failure behind "it spoke an error, then push-to-talk stopped
+        // working entirely": the spoken fallback used the audio device, and the
+        // next mic start tripped the exception.
+        //
+        // Tear down cleanly first, then refuse to proceed unless the input format
+        // is actually valid — throwing a normal Swift error the caller already
+        // recovers from (resets session state + tells the user to try again).
         let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-
         inputNode.removeTap(onBus: 0)
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.reset()
+
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            print("❌ BuddyDictationManager: input node reported an invalid format " +
+                  "(\(inputFormat.sampleRate) Hz, \(inputFormat.channelCount) ch) — aborting start safely")
+            throw BuddyDictationError.microphoneUnavailable
+        }
+
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
             self?.updateAudioPowerLevel(from: buffer)

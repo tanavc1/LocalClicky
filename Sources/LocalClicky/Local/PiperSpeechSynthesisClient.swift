@@ -192,7 +192,13 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
             newPlayer.delegate = self
             player = newPlayer
             isPlaying = true
-            newPlayer.play()
+            // If playback can't actually start, the finish-delegate never fires,
+            // so isPlaying would stay true forever — wedging the transient-hide
+            // loop and anything that waits on isPlaying. Drop the clip and move on.
+            if !newPlayer.play() {
+                player = nil
+                playNextIfIdle()
+            }
         } catch {
             // Skip the bad clip and keep going rather than getting stuck.
             playNextIfIdle()
