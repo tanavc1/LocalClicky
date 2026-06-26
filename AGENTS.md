@@ -25,15 +25,28 @@ API, no telemetry, no auto‑updater**.
 - **App type**: menu‑bar only (`LSUIElement=true`), not sandboxed (needs
   Accessibility + Screen Recording).
 - **Inference**: local Ollama over HTTP (`Sources/LocalBrainKit/OllamaClient.swift`),
-  `num_ctx` 8192 so a screenshot + history can't overrun context. No MLX, no bundled
-  LLM weights. (The neural TTS model/runtime *are* vendored in `vendor/sherpa/`.)
-- **Routing**: `ConversationRouter` picks screen vs text vs browser‑command per turn
+  a single consistent `num_ctx` (`LocalModels.defaultContextWindow`, 8192) on **every**
+  call — text, vision, and warm‑up — so a screenshot + history can't overrun context
+  *and* a model is never reloaded for a different context size (which matters when one
+  model fills both roles). No MLX, no bundled LLM weights. (The neural TTS model/runtime
+  *are* vendored in `vendor/sherpa/`.)
+- **Models are user‑selectable**: the defaults (`llama3.2:3b` text, `qwen2.5vl:3b`
+  vision) are tuned for 16 GB, but `ModelPreferences` + the panel's Models picker let a
+  user point either role at any installed Ollama model. The vision role is validated via
+  Ollama `/api/show` `capabilities` (must include `vision`); the text role must include
+  `completion`. `OllamaClient` exposes `listInstalledModels()` + `capabilities(of:)`.
+- **Routing**: `ConversationRouter` picks, per turn: `copyLastAnswer` / `openApp` /
+  `browserCommand` (deterministic actions, in that precedence) vs `screen` vs `text`
   (fixes follow‑ups; skips the VLM when the screen isn't needed).
 - **Voice**: neural Piper voice loaded once and held resident via the sherpa‑onnx C
   API (`PiperSpeechSynthesisClient`); spoken sentence‑by‑sentence as the answer
   streams (`SpokenTextSegmenter`). Apple voice is the automatic fallback.
-- **Browser**: `BrowserCommandPlanner` (NL → known URLs) + `BrowserActionExecutor`
-  (`NSWorkspace.open`). Navigation only — structurally can't click/submit/send.
+- **Actions (all deterministic + structurally safe)**:
+  - **Browser**: `BrowserCommandPlanner` (NL → known URLs) + `BrowserActionExecutor`
+    (`NSWorkspace.open`). Navigation only — can't click/submit/send.
+  - **App launch**: `AppCommandPlanner` (NL → app name, pure) + `LocalAppLauncher`
+    (Launch Services + a scan of the Applications folders → opens an installed app).
+  - **Clipboard**: "copy your answer" writes the last spoken answer to `NSPasteboard`.
 - **Pointing**: model emits `[POINT:x,y:label]` (or a bounding box);
   `PointingTagParser` reduces it to a center point in screenshot‑pixel space;
   `CompanionManager` maps that to a global AppKit coordinate; `BlueCursorView`
@@ -45,15 +58,18 @@ See `docs/ARCHITECTURE.md` for the full pipeline.
 
 | File | Purpose |
 |---|---|
-| `Sources/LocalBrainKit/OllamaClient.swift` | Async client for local Ollama (`/api/chat` streaming + images, health checks, `num_ctx`). |
+| `Sources/LocalBrainKit/OllamaClient.swift` | Async client for local Ollama (`/api/chat` streaming + images, health checks, `num_ctx`, installed‑model listing + `/api/show` capabilities, tag‑normalized install matching). |
 | `Sources/LocalBrainKit/PointingTag.swift` | Parses `[POINT:…]` / bounding boxes → a single center point. |
 | `Sources/LocalBrainKit/LocalPrompts.swift` | System prompts (with LocalClicky identity) for screen / text / onboarding. |
-| `Sources/LocalBrainKit/ConversationRouter.swift` | Per‑turn routing: screen vs text vs browser command. |
+| `Sources/LocalBrainKit/ConversationRouter.swift` | Per‑turn routing: clipboard / app‑launch / browser command vs screen vs text. |
 | `Sources/LocalBrainKit/SpokenTextSegmenter.swift` | Splits a streaming answer into speakable sentences (skips the `[POINT]` tag). |
 | `Sources/LocalBrainKit/BrowserCommandPlanner.swift` | Maps a spoken command → concrete browser URLs (known‑site table, Gmail compose). |
-| `Sources/LocalBrainKit/LocalModels.swift` | Model names + Ollama endpoint. |
-| `Sources/LocalClicky/App/CompanionManager.swift` | Central state machine; fully local answer pipeline + browser + streaming TTS + warm‑up. |
+| `Sources/LocalBrainKit/AppCommandPlanner.swift` | Pure NL → app‑name extraction + deterministic install‑name matching (used by the launcher and unit‑tested). |
+| `Sources/LocalBrainKit/LocalModels.swift` | Default model names, `ModelRole` (per‑role capability requirement), consistent `defaultContextWindow`, Ollama endpoint. |
+| `Sources/LocalClicky/App/CompanionManager.swift` | Central state machine; fully local answer pipeline + actions (browser/app/clipboard) + model selection + streaming TTS + warm‑up. |
 | `Sources/LocalClicky/App/LocalClickyApp.swift` | Menu‑bar app entry point. |
+| `Sources/LocalClicky/Actions/LocalAppLauncher.swift` | Resolves a spoken app name to an installed app (Launch Services + Applications scan) and opens it. |
+| `Sources/LocalClicky/Local/ModelPreferences.swift` | Persists the user's chat/vision model choices (defaults baked in). |
 | `Sources/LocalClicky/Local/PiperSpeechSynthesisClient.swift` | Neural Piper TTS via sherpa‑onnx C API (in‑process, resident model). |
 | `Sources/LocalClicky/Local/SpeechSynthesizing.swift` | TTS protocol + coordinator (Piper, Apple fallback) + streaming progress. |
 | `Sources/LocalClicky/Local/AppleSpeechSynthesisClient.swift` | Fallback on‑device TTS. |
@@ -70,7 +86,8 @@ See `docs/ARCHITECTURE.md` for the full pipeline.
 scripts/bootstrap-ollama.sh        # ensure Ollama + models
 scripts/fetch-tts.sh               # vendor the neural TTS runtime + Piper voice (once)
 swift build                        # compile everything (CLT, no Xcode)
-swift run localbrain-harness --selftest          # parser + router + segmenter + browser checks
+swift run localbrain-harness --selftest          # parser + router + planners + matching checks
+swift run localbrain-harness --models            # installed Ollama models + which role each can fill
 swift run localbrain-harness shot.png "where do I click?"   # real pipeline
 swift run localbrain-harness --benchmark shot.png 3         # latency benchmark
 scripts/build-app.sh && scripts/package-dmg.sh   # produce .app + DMG

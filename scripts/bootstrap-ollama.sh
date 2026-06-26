@@ -47,3 +47,8 @@ done
 
 echo ""
 echo "==> Local engine ready. LocalClicky will run fully on-device."
+echo ""
+echo "    These are the defaults, tuned for a 16 GB Mac. You can point either"
+echo "    role at any other model you pull — pick it in the app's Models section."
+echo "    More capable hardware? Try:  ollama pull qwen3-vl:8b   (sharper vision)"
+echo "    See what you have:           swift run localbrain-harness --models"

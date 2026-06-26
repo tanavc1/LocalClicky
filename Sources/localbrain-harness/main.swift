@@ -297,13 +297,115 @@ func runSelfTest() -> Never {
     check("unknown command not understood",
           BrowserCommandPlanner.plan(for: "open the file menu").isUnderstood == false)
 
-    print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
+    // --- AppCommandPlanner (open/launch local apps) ---
+    check("'launch spotify' → app name spotify",
+          AppCommandPlanner.appLaunchName(from: "launch spotify") == "spotify")
+    check("'open the notes app' → notes",
+          AppCommandPlanner.appLaunchName(from: "open the notes app") == "notes")
+    check("'open notes and write a list' → notes",
+          AppCommandPlanner.appLaunchName(from: "open notes and write a list") == "notes")
+    check("'open the activity monitor app' → activity monitor",
+          AppCommandPlanner.appLaunchName(from: "open the activity monitor app") == "activity monitor")
+    check("'launch visual studio code' → full name",
+          AppCommandPlanner.appLaunchName(from: "launch visual studio code") == "visual studio code")
+    check("bare 'open notes' (known app) → notes",
+          AppCommandPlanner.appLaunchName(from: "open notes") == "notes")
+    check("'open the file menu' is NOT an app launch",
+          !AppCommandPlanner.isAppLaunch("open the file menu"))
+    check("'open gmail' is NOT an app launch (stays browser)",
+          !AppCommandPlanner.isAppLaunch("open gmail"))
+    check("'open up a draft' is NOT an app launch",
+          !AppCommandPlanner.isAppLaunch("open up a draft"))
+
+    // --- New routes ---
+    check("'launch spotify' → openApp", route("launch spotify", ctx()) == .openApp)
+    check("'open the terminal app' → openApp", route("open the terminal app", ctx()) == .openApp)
+    check("'open notes' → openApp", route("open notes", ctx()) == .openApp)
+    check("app launch wins over browser for explicit phrasing",
+          route("launch chrome", ctx()) == .openApp)
+    check("'copy your answer' → copyLastAnswer", route("copy your answer", ctx()) == .copyLastAnswer)
+    check("'copy that to my clipboard' → copyLastAnswer",
+          route("copy that to my clipboard", ctx()) == .copyLastAnswer)
+    check("'copy what you just said' → copyLastAnswer",
+          route("copy what you just said", ctx()) == .copyLastAnswer)
+    check("plain 'copy this file' is NOT clipboard route",
+          route("how do i copy this file", ctx()) != .copyLastAnswer)
+    check("'open gmail' still → browserCommand", route("open gmail", ctx()) == .browserCommand)
+    check("'open a new tab and go to gmail' still → browserCommand",
+          route("open a new tab and go to gmail", ctx()) == .browserCommand)
+
+    // --- App name resolution (matching installed apps) ---
+    let installedSample = ["notes", "google chrome", "visual studio code", "activity monitor",
+                           "system settings", "messages", "xcode", "spotify"]
+    check("resolve 'notes' → notes",
+          AppCommandPlanner.resolveAppName("notes", installedNames: installedSample) == "notes")
+    check("resolve alias 'chrome' → google chrome",
+          AppCommandPlanner.resolveAppName("chrome", installedNames: installedSample) == "google chrome")
+    check("resolve alias 'vs code' → visual studio code",
+          AppCommandPlanner.resolveAppName("vs code", installedNames: installedSample) == "visual studio code")
+    check("resolve alias 'settings' → system settings",
+          AppCommandPlanner.resolveAppName("settings", installedNames: installedSample) == "system settings")
+    check("resolve 'activity monitor' → activity monitor",
+          AppCommandPlanner.resolveAppName("activity monitor", installedNames: installedSample) == "activity monitor")
+    check("resolve missing app → nil",
+          AppCommandPlanner.resolveAppName("photoshop", installedNames: installedSample) == nil)
+    check("'photoshop' does NOT false-match 'photos'",
+          AppCommandPlanner.resolveAppName("photoshop", installedNames: ["photos", "notes"]) == nil)
+    check("'calc' → calculator (prefix)",
+          AppCommandPlanner.resolveAppName("calc", installedNames: ["calculator", "calendar"]) == "calculator")
+    check("'monitor' → activity monitor (whole word)",
+          AppCommandPlanner.resolveAppName("monitor", installedNames: ["activity monitor", "notes"]) == "activity monitor")
+
+    // --- Model install matching (tag normalization) ---
+    check("exact tag matches",
+          OllamaClient.modelInstalled("llama3.2:3b", among: ["llama3.2:3b", "qwen2.5vl:3b"]))
+    check("tagless wanted matches :latest",
+          OllamaClient.modelInstalled("llama3.2", among: ["llama3.2:latest"]))
+    check("different tag does NOT match",
+          !OllamaClient.modelInstalled("llama3.2:3b", among: ["llama3.2:1b"]))
+    check("missing model not matched",
+          !OllamaClient.modelInstalled("mistral:7b", among: ["llama3.2:3b"]))
+
+    print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER + AGENT TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
     exit(failures == 0 ? 0 : 1)
+}
+
+/// Lists the models installed in the local Ollama and which LocalClicky role(s)
+/// each can fill, so a user can see what they're allowed to pick. Also doubles as
+/// a live check of the picker's data path (listInstalledModels + capabilities).
+func runModelList() async {
+    let client = OllamaClient()
+    print("=== Installed Ollama models (LocalClicky model picker) ===")
+    guard await client.isServerReachable() else {
+        print("❌ Ollama not reachable on \(client.baseURL). Start it: ollama serve")
+        exit(1)
+    }
+    guard let models = try? await client.listInstalledModels(), !models.isEmpty else {
+        print("No models installed. Pull one, e.g.: ollama pull \(LocalModels.defaultVisionModel)")
+        exit(1)
+    }
+    func pad(_ s: String, _ w: Int) -> String { s.count >= w ? s : s + String(repeating: " ", count: w - s.count) }
+    print("  " + pad("model", 26) + pad("size", 10) + "roles")
+    for model in models {
+        let caps = await client.capabilities(of: model.name)
+        var roles: [String] = []
+        if caps.contains("completion") { roles.append("text") }
+        if caps.contains("vision") { roles.append("vision") }
+        let roleText = roles.isEmpty ? "—" : roles.joined(separator: ", ")
+        let isDefault = model.name == LocalModels.defaultChatModel || model.name == LocalModels.defaultVisionModel
+        print("  " + pad(model.name, 26) + pad(model.sizeDescription, 10) + roleText + (isDefault ? "  (default)" : ""))
+    }
+    print("\nText role default:   \(LocalModels.defaultChatModel)")
+    print("Vision role default: \(LocalModels.defaultVisionModel)")
 }
 
 func runHarness() async {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments.first == "--selftest" { runSelfTest() }
+    if arguments.first == "--models" {
+        await runModelList()
+        return
+    }
     if arguments.first == "--benchmark" {
         let benchImage = arguments.count >= 2 ? arguments[1] : nil
         let iterations = arguments.count >= 3 ? (Int(arguments[2]) ?? 3) : 3

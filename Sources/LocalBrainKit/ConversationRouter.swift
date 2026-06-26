@@ -28,6 +28,12 @@ public enum ConversationRoute: Equatable, Sendable {
     case screen
     case text
     case browserCommand
+    /// Open / launch a local macOS application ("launch spotify", "open the
+    /// notes app"). Handled by LocalAppLauncher.
+    case openApp
+    /// Copy the companion's last spoken answer to the clipboard ("copy your
+    /// answer", "put that on my clipboard").
+    case copyLastAnswer
 }
 
 public enum ConversationRouter {
@@ -59,8 +65,15 @@ public enum ConversationRouter {
     public static func route(transcript: String, context: Context) -> ConversationRoute {
         let text = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // 1) Explicit "do something in the browser" wins over everything — it's
-        //    an action request, not a question.
+        // 1) Deterministic action requests win over questions, in order of how
+        //    unambiguous they are:
+        //    a) "copy your answer to the clipboard" — refers to what we just said.
+        if wantsCopyLastAnswer(text) { return .copyLastAnswer }
+        //    b) "launch spotify" / "open the notes app" — open an installed app.
+        //       Checked before the browser so explicit app phrasing isn't read as
+        //       a website (e.g. "launch spotify" opens the app, not spotify.com).
+        if AppCommandPlanner.isAppLaunch(text) { return .openApp }
+        //    c) "open a new tab and go to gmail" — navigate the browser.
         if isBrowserCommand(text) { return .browserCommand }
 
         // 2) No screen this turn (text-only mode, or no permission) → text path.
@@ -70,6 +83,28 @@ public enum ConversationRouter {
         //    the text model when the turn is clearly self-contained.
         if isClearlyTextOnly(text, context: context) { return .text }
         return .screen
+    }
+
+    // MARK: - Clipboard
+
+    /// True when the user is asking to copy the companion's previous answer to the
+    /// clipboard. Tightly phrased (it must reference the answer or name the
+    /// clipboard) so an on-screen "copy this file" never triggers it.
+    static func wantsCopyLastAnswer(_ text: String) -> Bool {
+        // "... clipboard" paired with a copy/save verb.
+        if text.contains("clipboard"),
+           text.contains("copy") || text.contains("put ") || text.contains("save")
+            || text.contains("stick ") || text.contains("add ") {
+            return true
+        }
+        // Phrases that explicitly reference the assistant's answer.
+        let answerPhrases = [
+            "copy your answer", "copy the answer", "copy that answer",
+            "copy your response", "copy that response", "copy your reply",
+            "copy your last answer", "copy your message", "copy your last message",
+            "copy what you said", "copy what you just said", "copy that down",
+        ]
+        return answerPhrases.contains(where: text.contains)
     }
 
     // MARK: - Browser commands

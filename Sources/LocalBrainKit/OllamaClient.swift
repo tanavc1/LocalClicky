@@ -41,6 +41,27 @@ public struct OllamaChatResult: Sendable {
     public let tokensPerSecond: Double?
 }
 
+/// One model installed in the local Ollama, as surfaced to the model picker.
+public struct InstalledOllamaModel: Sendable, Equatable {
+    public let name: String          // e.g. "qwen2.5vl:3b"
+    public let sizeBytes: Int64      // on-disk size, for a friendly "3.2 GB" label
+    public let family: String?       // e.g. "qwen25vl" (a hint, not authoritative)
+
+    public init(name: String, sizeBytes: Int64, family: String?) {
+        self.name = name
+        self.sizeBytes = sizeBytes
+        self.family = family
+    }
+
+    /// A human-friendly size like "3.2 GB" / "780 MB".
+    public var sizeDescription: String {
+        let gb = Double(sizeBytes) / 1_000_000_000
+        if gb >= 1 { return String(format: "%.1f GB", gb) }
+        let mb = Double(sizeBytes) / 1_000_000
+        return String(format: "%.0f MB", mb)
+    }
+}
+
 public enum OllamaError: Error, LocalizedError {
     /// The local Ollama server isn't reachable on the configured port.
     case serverUnreachable
@@ -123,13 +144,74 @@ public final class OllamaClient: @unchecked Sendable {
     /// Names of `LocalModels.requiredModels` that aren't installed yet, so the
     /// app can tell the user exactly which `ollama pull` to run.
     public func missingRequiredModels() async throws -> [String] {
-        let installed = Set(try await installedModelNames())
-        return LocalModels.requiredModels.filter { required in
-            // Ollama lets a tagless name match its :latest; also tolerate the
-            // exact tagged name. Match on the bare repo if the user pulled a
-            // differently-tagged build of the same model family.
-            !installed.contains(required)
+        try await missingModels(LocalModels.requiredModels)
+    }
+
+    /// Of the given model names, the ones not currently installed in Ollama.
+    /// Used for the default required models and for whatever models the user has
+    /// selected for the chat/vision roles.
+    public func missingModels(_ models: [String]) async throws -> [String] {
+        let installed = try await installedModelNames()
+        return models.filter { !Self.modelInstalled($0, among: installed) }
+    }
+
+    /// True if `wanted` is satisfied by something in `installed`. Ollama stores a
+    /// tagless pull as `:latest`, so we normalize both sides before comparing —
+    /// that way "llama3.2" matches an installed "llama3.2:latest" while a specific
+    /// tag like "llama3.2:3b" still only matches its own tag. Pure + static so it
+    /// can be unit-tested from the harness without a running server.
+    public static func modelInstalled(_ wanted: String, among installed: [String]) -> Bool {
+        func normalize(_ name: String) -> String {
+            name.contains(":") ? name : name + ":latest"
         }
+        let target = normalize(wanted)
+        return installed.contains { normalize($0) == target }
+    }
+
+    /// Every model installed in Ollama, with size + family, for the model picker.
+    public func listInstalledModels() async throws -> [InstalledOllamaModel] {
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/tags"))
+        request.timeoutInterval = 8
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw OllamaError.serverUnreachable
+        }
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw OllamaError.serverUnreachable
+        }
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = payload["models"] as? [[String: Any]] else {
+            throw OllamaError.malformedResponse("missing models array in /api/tags")
+        }
+        return models.compactMap { entry in
+            guard let name = entry["name"] as? String else { return nil }
+            let size = (entry["size"] as? NSNumber)?.int64Value ?? 0
+            let family = (entry["details"] as? [String: Any])?["family"] as? String
+            return InstalledOllamaModel(name: name, sizeBytes: size, family: family)
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// The capabilities Ollama reports for a model (e.g. `["completion", "vision"]`).
+    /// Used to validate that a model the user picked for the vision role can
+    /// actually accept images. Returns an empty set if the model or server can't
+    /// be queried, so callers can decide how strict to be.
+    public func capabilities(of model: String) async -> Set<String> {
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/show"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 8
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model])
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let capabilities = payload["capabilities"] as? [String] else {
+            return []
+        }
+        return Set(capabilities)
     }
 
     // MARK: - Streaming chat

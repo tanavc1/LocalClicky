@@ -8,6 +8,7 @@
 //
 
 import AVFoundation
+import LocalBrainKit
 import SwiftUI
 
 struct CompanionPanelView: View {
@@ -29,6 +30,12 @@ struct CompanionPanelView: View {
                     .frame(height: 12)
 
                 modelPickerRow
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 10)
+
+                modelsSection
                     .padding(.horizontal, 16)
             }
 
@@ -592,6 +599,112 @@ struct CompanionPanelView: View {
         .pointerCursor()
     }
 
+    // MARK: - Model Picker (custom local models)
+
+    /// Lets the user point each role at any installed Ollama model. The vision
+    /// menu only lists models that can actually accept images, so the screen
+    /// features can never be wired to a text-only model.
+    private var modelsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("MODELS")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Spacer()
+                if companionManager.chatModelName != LocalModels.defaultChatModel
+                    || companionManager.visionModelName != LocalModels.defaultVisionModel {
+                    Button("Reset") { companionManager.resetModelsToDefaults() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.blue400)
+                        .pointerCursor()
+                }
+            }
+
+            modelDropdownRow(
+                title: "Text",
+                current: companionManager.chatModelName,
+                options: chatModelOptions,
+                role: .chat
+            )
+            modelDropdownRow(
+                title: "Vision",
+                current: companionManager.visionModelName,
+                options: visionModelOptions,
+                role: .vision
+            )
+        }
+    }
+
+    /// Installed models valid for the text role (anything that generates text).
+    private var chatModelOptions: [InstalledOllamaModel] {
+        let capable = companionManager.chatCapableModelNames
+        let all = companionManager.installedModels
+        return capable.isEmpty ? all : all.filter { capable.contains($0.name) }
+    }
+
+    /// Installed models valid for the vision role (must accept images).
+    private var visionModelOptions: [InstalledOllamaModel] {
+        let capable = companionManager.visionCapableModelNames
+        return companionManager.installedModels.filter { capable.contains($0.name) }
+    }
+
+    private func modelDropdownRow(
+        title: String,
+        current: String,
+        options: [InstalledOllamaModel],
+        role: ModelRole
+    ) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            Menu {
+                if options.isEmpty {
+                    Text("No compatible models found")
+                } else {
+                    ForEach(options, id: \.name) { model in
+                        Button(action: { companionManager.setModel(model.name, for: role) }) {
+                            if model.name == current {
+                                Label("\(model.name)  ·  \(model.sizeDescription)", systemImage: "checkmark")
+                            } else {
+                                Text("\(model.name)  ·  \(model.sizeDescription)")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(current)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .pointerCursor()
+        }
+        .padding(.vertical, 2)
+    }
+
     // MARK: - Local Engine Status
 
     /// Status of the on-device inference engine (Ollama). Clicking re-checks it.
@@ -611,6 +724,7 @@ struct CompanionPanelView: View {
 
         return Button(action: {
             companionManager.refreshLocalEngineStatus()
+            companionManager.refreshInstalledModels()
         }) {
             HStack(spacing: 8) {
                 Image(systemName: iconName)

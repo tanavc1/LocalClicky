@@ -62,6 +62,26 @@ final class CompanionManager: ObservableObject {
     /// exact `ollama pull` to run).
     @Published private(set) var missingLocalModels: [String] = []
 
+    /// The Ollama model powering each role. Defaults to LocalClicky's bundled
+    /// choices; the user can repoint either at any installed model that's capable
+    /// of the role (see the model picker). Persisted via ModelPreferences.
+    @Published private(set) var chatModelName: String = ModelPreferences.chatModel
+    @Published private(set) var visionModelName: String = ModelPreferences.visionModel
+
+    /// Every model installed in the user's Ollama, for the model picker, plus the
+    /// subset that can accept images — so the vision role can only ever be filled
+    /// by a model that can actually see the screen.
+    @Published private(set) var installedModels: [InstalledOllamaModel] = []
+    @Published private(set) var visionCapableModelNames: Set<String> = []
+    /// Models that can generate text (excludes embedding-only models), so the
+    /// text-role picker never offers something that can't hold a conversation.
+    @Published private(set) var chatCapableModelNames: Set<String> = []
+
+    /// The companion's most recent real spoken answer, for the "copy your answer"
+    /// clipboard action. Set only by the text/vision answer path (not by browser
+    /// or app-launch actions), so "copy that" always grabs the actual answer.
+    private var lastSpokenAnswer: String?
+
     // MARK: - Onboarding state (kept for the overlay's first-run experience)
 
     @Published var onboardingVideoPlayer: AVPlayer?
@@ -191,6 +211,7 @@ final class CompanionManager: ObservableObject {
         // Ollama models loaded and resident (keep_alive keeps them warm).
         speechSynthesizer.warmUp()
         warmUpLocalModels()
+        refreshInstalledModels()
 
         // If onboarding is done and permissions are granted, show the cursor now.
         if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
@@ -200,39 +221,94 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Sends a tiny throwaway request to each local model so Ollama loads them
-    /// into memory before the first real question. With keep_alive they stay
-    /// resident, turning a cold multi-second first answer into a warm one.
+    /// Sends a tiny throwaway request to each selected local model so Ollama loads
+    /// it into memory before the first real question. With keep_alive they stay
+    /// resident, turning a cold multi-second first answer into a warm one. The
+    /// context window matches what the real requests use (and is identical across
+    /// roles) so Ollama never reloads a model for a different num_ctx — which also
+    /// matters when one model is picked for both roles.
     private func warmUpLocalModels() {
+        // De-dupe in case the same model fills both roles.
+        let models = Array(Set([chatModelName, visionModelName]))
         Task.detached(priority: .utility) { [ollamaClient] in
-            for model in LocalModels.requiredModels {
-                let contextWindow = model == LocalModels.chatModel ? 4096 : 8192
+            for model in models {
                 _ = try? await ollamaClient.streamChat(
                     model: model,
                     messages: [.user("hi")],
                     temperature: 0.0,
                     maxTokens: 1,
-                    contextWindow: contextWindow,
+                    contextWindow: LocalModels.defaultContextWindow,
                     onText: { _ in }
                 )
             }
         }
     }
 
-    /// Checks that the local Ollama server is up and the required models are
+    /// Checks that the local Ollama server is up and the *selected* models are
     /// installed, so the panel can guide the user if not.
     func refreshLocalEngineStatus() {
+        let selected = Array(Set([chatModelName, visionModelName]))
         Task {
             let reachable = await ollamaClient.isServerReachable()
             var missing: [String] = []
             if reachable {
-                missing = (try? await ollamaClient.missingRequiredModels()) ?? []
+                missing = (try? await ollamaClient.missingModels(selected)) ?? []
             }
             await MainActor.run {
                 self.isLocalEngineReachable = reachable
                 self.missingLocalModels = missing
             }
         }
+    }
+
+    /// Loads the list of installed Ollama models (for the model picker) and
+    /// figures out which of them can accept images, so the vision role can only
+    /// be filled by a vision-capable model.
+    func refreshInstalledModels() {
+        Task {
+            guard let models = try? await ollamaClient.listInstalledModels(), !models.isEmpty else {
+                return
+            }
+            var visionCapable = Set<String>()
+            var chatCapable = Set<String>()
+            for model in models {
+                let capabilities = await ollamaClient.capabilities(of: model.name)
+                if capabilities.contains("vision") { visionCapable.insert(model.name) }
+                // "completion" means it generates text; embedding-only models don't.
+                if capabilities.contains("completion") { chatCapable.insert(model.name) }
+            }
+            await MainActor.run {
+                self.installedModels = models
+                self.visionCapableModelNames = visionCapable
+                self.chatCapableModelNames = chatCapable
+            }
+        }
+    }
+
+    /// Repoints a role at a different installed model, persists the choice, and
+    /// warms the new model so the next answer is snappy. The picker only offers
+    /// valid models per role, so no extra validation is needed here.
+    func setModel(_ name: String, for role: ModelRole) {
+        switch role {
+        case .chat:
+            guard name != chatModelName else { return }
+            chatModelName = name
+        case .vision:
+            guard name != visionModelName else { return }
+            visionModelName = name
+        }
+        ModelPreferences.setModel(name, for: role)
+        warmUpLocalModels()
+        refreshLocalEngineStatus()
+    }
+
+    /// Restores both roles to LocalClicky's default models.
+    func resetModelsToDefaults() {
+        ModelPreferences.resetToDefaults()
+        chatModelName = ModelPreferences.chatModel
+        visionModelName = ModelPreferences.visionModel
+        warmUpLocalModels()
+        refreshLocalEngineStatus()
     }
 
     /// Called by BlueCursorView after the buddy finishes its pointing animation.
@@ -555,14 +631,22 @@ final class CompanionManager: ObservableObject {
                     )
                 )
 
-                // A browser command ("open gmail and start a draft") is an action,
-                // not a question — hand it to the executor and we're done.
+                // Deterministic action requests (browser nav, launching an app,
+                // copying the last answer) are handled before any screenshot —
+                // they're actions, not questions, and each is structurally safe.
                 if route == .browserCommand {
                     await handleBrowserCommand(transcript: transcript)
-                    if !Task.isCancelled {
-                        voiceState = .idle
-                        scheduleTransientHideIfNeeded()
-                    }
+                    settleAfterAction()
+                    return
+                }
+                if route == .openApp {
+                    await handleOpenAppCommand(transcript: transcript)
+                    settleAfterAction()
+                    return
+                }
+                if route == .copyLastAnswer {
+                    await handleCopyLastAnswer()
+                    settleAfterAction()
                     return
                 }
 
@@ -580,10 +664,10 @@ final class CompanionManager: ObservableObject {
                         imageWidthInPixels: capture.screenshotWidthInPixels,
                         imageHeightInPixels: capture.screenshotHeightInPixels
                     )
-                    model = LocalModels.visionModel
+                    model = visionModelName
                 } else {
                     systemPrompt = LocalPrompts.textVoiceResponse
-                    model = LocalModels.chatModel
+                    model = chatModelName
                 }
 
                 guard !Task.isCancelled else { return }
@@ -619,7 +703,7 @@ final class CompanionManager: ObservableObject {
                     messages: messages,
                     temperature: cursorScreenCapture == nil ? 0.7 : 0.3,
                     maxTokens: cursorScreenCapture == nil ? 220 : 180,
-                    contextWindow: cursorScreenCapture == nil ? 4096 : 8192,
+                    contextWindow: LocalModels.defaultContextWindow,
                     onText: { accumulated in
                         let speakable = SpokenTextSegmenter.speakablePrefix(accumulated)
                         if let (sentence, _) = speechProgress.advance(speakable: speakable) {
@@ -659,6 +743,10 @@ final class CompanionManager: ObservableObject {
                 if conversationHistory.count > 10 {
                     conversationHistory.removeFirst(conversationHistory.count - 10)
                 }
+                // Remember the answer so "copy your answer" can put it on the
+                // clipboard (only real answers — not browser/app confirmations).
+                let trimmedSpoken = spokenText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedSpoken.isEmpty { lastSpokenAnswer = trimmedSpoken }
                 // Remember whether we actually looked at the screen, so the next
                 // turn's router can read pronouns correctly.
                 previousTurnUsedScreen = (cursorScreenCapture != nil)
@@ -713,6 +801,74 @@ final class CompanionManager: ObservableObject {
         voiceState = .responding
         do { try await speechSynthesizer.speakText(plan.spokenSummary) }
         catch { print("⚠️ TTS error during browser command: \(error)") }
+    }
+
+    /// Returns the companion to idle after a deterministic action (browser, app
+    /// launch, clipboard), matching the rest of the pipeline. Kept in one place so
+    /// every action route settles the same way.
+    private func settleAfterAction() {
+        if !Task.isCancelled {
+            voiceState = .idle
+            scheduleTransientHideIfNeeded()
+        }
+    }
+
+    /// Opens a local macOS application by name ("launch spotify", "open the notes
+    /// app"). Resolves the spoken name to an app that's actually installed; if
+    /// nothing matches it gracefully falls back to a browser navigation for the
+    /// same words (so "launch youtube", which has no app, still opens the site),
+    /// and only then says it couldn't find it. Launching an installed app is as
+    /// safe as double-clicking it in Finder.
+    private func handleOpenAppCommand(transcript: String) async {
+        let spokenName = AppCommandPlanner.appLaunchName(from: transcript) ?? transcript
+        let summary: String
+
+        if let launchedName = LocalAppLauncher.launchApp(named: spokenName) {
+            summary = "opening \(launchedName.lowercased()) for you."
+            print("🚀 App: launched \(launchedName)")
+        } else {
+            // No installed app matched — try the same words as a web destination
+            // before giving up, so we still do something useful when we can.
+            let browserPlan = BrowserCommandPlanner.plan(for: transcript)
+            if browserPlan.isUnderstood {
+                BrowserActionExecutor.execute(browserPlan)
+                summary = browserPlan.spokenSummary
+                print("🌐 App not found; opened web fallback for \(spokenName)")
+            } else {
+                summary = "i couldn't find an app called \(spokenName) on your mac."
+                print("🚫 App: no match for \(spokenName)")
+            }
+        }
+
+        conversationHistory.append((userTranscript: transcript, assistantResponse: summary))
+        if conversationHistory.count > 10 {
+            conversationHistory.removeFirst(conversationHistory.count - 10)
+        }
+        previousTurnUsedScreen = false
+
+        voiceState = .responding
+        do { try await speechSynthesizer.speakText(summary) }
+        catch { print("⚠️ TTS error during app command: \(error)") }
+    }
+
+    /// Copies the companion's last real spoken answer to the system clipboard.
+    /// Useful right after asking it to write, translate, or summarize something.
+    private func handleCopyLastAnswer() async {
+        let summary: String
+        if let answer = lastSpokenAnswer, !answer.isEmpty {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(answer, forType: .string)
+            summary = "copied that to your clipboard."
+            print("📋 Clipboard: copied \(answer.count) chars")
+        } else {
+            summary = "i don't have an answer to copy yet. ask me something first."
+        }
+
+        previousTurnUsedScreen = false
+        voiceState = .responding
+        do { try await speechSynthesizer.speakText(summary) }
+        catch { print("⚠️ TTS error during clipboard command: \(error)") }
     }
 
     /// Converts a point in the screenshot's pixel space (top-left origin) to a
@@ -843,7 +999,7 @@ final class CompanionManager: ObservableObject {
                     imageHeightInPixels: cursorScreenCapture.screenshotHeightInPixels
                 )
                 let result = try await ollamaClient.streamChat(
-                    model: LocalModels.visionModel,
+                    model: visionModelName,
                     messages: [
                         .system(systemPrompt),
                         .user("look around my screen and find something interesting to point at",
@@ -851,6 +1007,7 @@ final class CompanionManager: ObservableObject {
                     ],
                     temperature: 0.4,
                     maxTokens: 120,
+                    contextWindow: LocalModels.defaultContextWindow,
                     onText: { _ in }
                 )
 

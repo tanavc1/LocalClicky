@@ -87,9 +87,16 @@ private final class AppleSpeechTranscriptionSession: NSObject, BuddyStreamingTra
         recognitionRequest.taskHint = .dictation
         recognitionRequest.addsPunctuation = true
 
-        if speechRecognizer.supportsOnDeviceRecognition {
-            recognitionRequest.requiresOnDeviceRecognition = true
-        }
+        // LocalClicky's core promise is that nothing you say leaves the machine,
+        // so we ALWAYS require on-device recognition — never only "if supported."
+        // The previous conditional silently let Apple's *cloud* speech servers
+        // handle audio on any config where on-device wasn't available, which would
+        // ship the user's microphone audio off-device. Forcing it means that on an
+        // unsupported locale recognition fails locally (the dictation manager shows
+        // "try again") instead of quietly leaking audio — the right trade-off for a
+        // no-cloud app. On Apple-silicon macOS 14+ (en-US, our target) on-device is
+        // supported, so this doesn't change the normal path.
+        recognitionRequest.requiresOnDeviceRecognition = true
 
         recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             self?.handleRecognitionEvent(result: result, error: error)
