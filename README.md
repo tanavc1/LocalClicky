@@ -65,10 +65,17 @@ grant the four permissions it asks for, then hold **Control + Option** and talk.
 ```bash
 scripts/bootstrap-ollama.sh   # ensure Ollama + the default models
 scripts/fetch-tts.sh          # vendor the neural voice + TTS runtime (optional)
-scripts/install.sh            # build, clean-install to /Applications, launch
+scripts/install.sh            # build + clean-install to /Applications (resets permissions)
+scripts/update.sh             # rebuild + reinstall in place, KEEPING your permissions
 scripts/build-app.sh          # just build dist/LocalClicky.app (no install)
 scripts/package-dmg.sh        # wrap it into a drag-to-Applications DMG
 ```
+
+> **Updating later?** Use `scripts/update.sh` — it reinstalls the new build with
+> the same stable signing identity, so your granted permissions carry over and you
+> don't have to re-grant anything. (`install.sh` is the from-scratch path that
+> wipes and re-grants.) The first build in a new login session may show a one-time
+> keychain prompt for the local signing key — click **Always Allow**.
 
 ### Prefer Xcode?
 
