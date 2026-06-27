@@ -223,6 +223,7 @@ final class CompanionManager: ObservableObject {
         // interaction is snappy: the neural voice's inference graph, and both
         // Ollama models loaded and resident (keep_alive keeps them warm).
         refreshHardwareRecommendation()
+        refreshOllamaInstalled()
         speechSynthesizer.warmUp()
         warmUpLocalModels()
         refreshInstalledModels()
@@ -410,6 +411,140 @@ final class CompanionManager: ObservableObject {
         guard !installedModels.isEmpty else { return groundingModelName }
         let names = installedModels.map { $0.name }
         return OllamaClient.modelInstalled(groundingModelName, among: names) ? groundingModelName : visionModelName
+    }
+
+    // MARK: - Model downloads + Ollama install
+
+    /// Whether Ollama appears installed at all (distinct from "running").
+    @Published private(set) var isOllamaInstalled: Bool = true
+    /// The model currently downloading (nil when idle), its 0…1 progress, and a
+    /// short status line ("downloading", "verifying", "ready").
+    @Published private(set) var downloadingModelName: String?
+    @Published private(set) var downloadFraction: Double = 0
+    @Published private(set) var downloadStatusText: String?
+    /// Ollama install flow state for the panel button.
+    @Published private(set) var ollamaInstallInProgress = false
+    @Published var ollamaInstallMessage: String?
+
+    private var downloadTask: Task<Void, Never>?
+
+    /// Curated models that both FIT this machine (resident footprint ≤ total RAM,
+    /// with margin) and aren't installed yet — exactly what the download dropdown
+    /// should offer. "Only download if it fits."
+    var downloadableModels: [CatalogModel] {
+        let installedNames = installedModels.map { $0.name }
+        return ModelCatalog.all.filter { model in
+            let alreadyInstalled = installedNames.contains { OllamaClient.modelInstalled(model.name, among: [$0]) }
+            let fits = model.residentGB + 1.5 <= hardwareProfile.totalRAMGB
+            return !alreadyInstalled && fits
+        }
+    }
+
+    /// True if `name` is the advisor's recommended model for one of the roles
+    /// (so the download dropdown can mark it).
+    func isRecommendedModel(_ name: String) -> Bool {
+        let rec = hardwareRecommendation
+        return name == rec.chatModel || name == rec.visionModel || name == rec.groundingModel
+    }
+
+    func refreshOllamaInstalled() {
+        isOllamaInstalled = OllamaInstaller.isInstalled()
+    }
+
+    /// One-click: download a model with streamed progress, then refresh the model
+    /// lists and warm it straight into RAM so it's ready to use immediately.
+    func downloadModel(_ name: String) {
+        guard downloadingModelName == nil else { return }
+        downloadingModelName = name
+        downloadFraction = 0
+        downloadStatusText = "starting…"
+        let client = ollamaClient
+        downloadTask = Task { [weak self] in
+            do {
+                for try await progress in client.pullModel(name) {
+                    if Task.isCancelled { break }
+                    await MainActor.run {
+                        self?.downloadFraction = progress.fraction
+                        self?.downloadStatusText = progress.status
+                    }
+                }
+                await MainActor.run {
+                    guard let self else { return }
+                    self.downloadFraction = 1
+                    self.downloadStatusText = "ready"
+                    self.downloadingModelName = nil
+                    self.refreshInstalledModels()
+                    self.refreshLocalEngineStatus()
+                    self.warmUpModel(name)   // resident + ready to use right away
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.downloadStatusText = nil }
+                }
+            } catch {
+                await MainActor.run {
+                    self?.downloadStatusText = "download failed — try again"
+                    self?.downloadFraction = 0
+                    self?.downloadingModelName = nil
+                }
+            }
+        }
+    }
+
+    func cancelDownload() {
+        downloadTask?.cancel()
+        downloadTask = nil
+        downloadingModelName = nil
+        downloadStatusText = nil
+        downloadFraction = 0
+    }
+
+    /// Warms a single model into memory (used right after a download completes).
+    private func warmUpModel(_ name: String) {
+        let ctx = contextWindow(forModel: name)
+        let keepAlive = hardwareRecommendation.keepAlive
+        let client = ollamaClient
+        Task.detached(priority: .utility) {
+            _ = try? await client.streamChat(
+                model: name, messages: [.user("hi")], temperature: 0.0, maxTokens: 1,
+                keepAlive: keepAlive, contextWindow: ctx, onText: { _ in })
+        }
+    }
+
+    /// One-click Ollama setup: if it's installed but not running, launch it; if
+    /// it's not installed, download + install the official app (with a browser
+    /// fallback). Network here is the single user-initiated fetch from ollama.com.
+    func installOrStartOllama() {
+        guard !ollamaInstallInProgress else { return }
+        if OllamaInstaller.isInstalled() {
+            OllamaInstaller.launchInstalledApp()
+            ollamaInstallMessage = "starting ollama…"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.refreshLocalEngineStatus()
+                self?.refreshOllamaInstalled()
+                self?.warmUpLocalModels()
+            }
+            return
+        }
+        ollamaInstallInProgress = true
+        ollamaInstallMessage = "downloading ollama…"
+        Task { [weak self] in
+            let outcome = await OllamaInstaller.install()
+            await MainActor.run {
+                guard let self else { return }
+                self.ollamaInstallInProgress = false
+                switch outcome {
+                case .installedAndLaunched:
+                    self.ollamaInstallMessage = "ollama installed — starting up…"
+                case .openedDownloadPage:
+                    self.ollamaInstallMessage = "opened the ollama download page — drag it to Applications, then reopen."
+                case .failed(let detail):
+                    self.ollamaInstallMessage = "couldn't install ollama: \(detail)"
+                }
+                self.refreshOllamaInstalled()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                    self.refreshLocalEngineStatus()
+                    self.refreshOllamaInstalled()
+                }
+            }
+        }
     }
 
     /// Restores both roles to LocalClicky's default models.

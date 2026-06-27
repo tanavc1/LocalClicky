@@ -14,6 +14,10 @@ import SwiftUI
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
 
+    /// The model chosen in the "Add a model" dropdown (before hitting Download).
+    /// Empty means "use the recommended/first fitting model".
+    @State private var selectedDownloadModel: String = ""
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             panelHeader
@@ -37,6 +41,10 @@ struct CompanionPanelView: View {
 
                 modelsSection
                     .padding(.horizontal, 16)
+
+                modelDownloadSection
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -52,6 +60,9 @@ struct CompanionPanelView: View {
                     .frame(height: 16)
 
                 localEngineStatusCard
+                    .padding(.horizontal, 16)
+
+                ollamaSetupButton
                     .padding(.horizontal, 16)
             }
 
@@ -614,11 +625,12 @@ struct CompanionPanelView: View {
                     Text("No compatible models found")
                 } else {
                     ForEach(options, id: \.name) { model in
+                        let suffix = companionManager.isRecommendedModel(model.name) ? "  ·  best for your mac" : ""
                         Button(action: { companionManager.setModel(model.name, for: role) }) {
                             if model.name == current {
-                                Label("\(model.name)  ·  \(model.sizeDescription)", systemImage: "checkmark")
+                                Label("\(model.name)  ·  \(model.sizeDescription)\(suffix)", systemImage: "checkmark")
                             } else {
-                                Text("\(model.name)  ·  \(model.sizeDescription)")
+                                Text("\(model.name)  ·  \(model.sizeDescription)\(suffix)")
                             }
                         }
                     }
@@ -652,6 +664,152 @@ struct CompanionPanelView: View {
         .padding(.vertical, 2)
     }
 
+    // MARK: - Model Download (one-click, fit-gated)
+
+    /// The effective model to download: the dropdown selection if still valid,
+    /// otherwise the advisor's recommended fitting model, otherwise the first.
+    private var effectiveDownloadChoice: CatalogModel? {
+        let models = companionManager.downloadableModels
+        if let chosen = models.first(where: { $0.name == selectedDownloadModel }) { return chosen }
+        return models.first(where: { companionManager.isRecommendedModel($0.name) }) ?? models.first
+    }
+
+    /// Lists curated models that fit this Mac and aren't installed, with sizes +
+    /// a "best" marker, and one-click downloads them with live progress. Only
+    /// shown when Ollama is running (you can't pull without it).
+    @ViewBuilder
+    private var modelDownloadSection: some View {
+        if companionManager.isLocalEngineReachable {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("ADD A MODEL")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundColor(DS.Colors.textTertiary)
+                    Spacer()
+                    if companionManager.autotuneStatus.isInstalled {
+                        Text("autotune ✓")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(Color(red: 0.45, green: 0.8, blue: 0.5))
+                    }
+                }
+
+                if let downloading = companionManager.downloadingModelName {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Text(downloading)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(DS.Colors.textPrimary)
+                            Spacer()
+                            Text(companionManager.downloadStatusText ?? "")
+                                .font(.system(size: 10))
+                                .foregroundColor(DS.Colors.textTertiary)
+                            Button("Cancel") { companionManager.cancelDownload() }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(DS.Colors.blue400)
+                                .pointerCursor()
+                        }
+                        ProgressView(value: companionManager.downloadFraction)
+                            .progressViewStyle(.linear)
+                            .tint(DS.Colors.accent)
+                    }
+                } else if companionManager.downloadableModels.isEmpty {
+                    Text("All models that fit this Mac are installed.")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                } else {
+                    downloadPickerRow
+                }
+            }
+        }
+    }
+
+    private var downloadPickerRow: some View {
+        HStack(spacing: 8) {
+            Menu {
+                ForEach(companionManager.downloadableModels, id: \.name) { model in
+                    let best = companionManager.isRecommendedModel(model.name) ? "  ·  best" : ""
+                    Button(action: { selectedDownloadModel = model.name }) {
+                        Text(String(format: "%@  ·  %.1f GB%@", model.name, model.sizeGB, best))
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(effectiveDownloadChoice.map { String(format: "%@ · %.1f GB", $0.name, $0.sizeGB) } ?? "Choose a model")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.06)))
+                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(DS.Colors.borderSubtle, lineWidth: 0.5))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .pointerCursor()
+
+            Spacer()
+
+            Button(action: {
+                if let choice = effectiveDownloadChoice { companionManager.downloadModel(choice.name) }
+            }) {
+                Text("Download")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(DS.Colors.textOnAccent)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(DS.Colors.accent))
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .disabled(effectiveDownloadChoice == nil)
+        }
+    }
+
+    // MARK: - Ollama setup (download / start)
+
+    /// Shown when the local engine isn't reachable: a one-click button to either
+    /// start an installed Ollama or download + install it.
+    @ViewBuilder
+    private var ollamaSetupButton: some View {
+        if !companionManager.isLocalEngineReachable {
+            VStack(alignment: .leading, spacing: 6) {
+                Button(action: { companionManager.installOrStartOllama() }) {
+                    HStack(spacing: 6) {
+                        if companionManager.ollamaInstallInProgress {
+                            ProgressView().controlSize(.small).scaleEffect(0.8)
+                        } else {
+                            Image(systemName: companionManager.isOllamaInstalled ? "play.fill" : "arrow.down.circle.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        Text(companionManager.isOllamaInstalled ? "Start Ollama" : "Download Ollama")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundColor(DS.Colors.textOnAccent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous).fill(DS.Colors.accent))
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+                .disabled(companionManager.ollamaInstallInProgress)
+
+                if let message = companionManager.ollamaInstallMessage {
+                    Text(message)
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, 8)
+        }
+    }
+
     // MARK: - Local Engine Status
 
     /// Status of the on-device inference engine (Ollama). Clicking re-checks it.
@@ -665,8 +823,10 @@ struct CompanionPanelView: View {
         let title = allReady ? "Local engine ready" : (reachable ? "Models missing" : "Ollama not running")
         let detail: String = {
             if allReady { return "All on-device · nothing leaves your Mac" }
-            if !reachable { return "Start it in Terminal: ollama serve" }
-            return "Run: ollama pull " + missing.joined(separator: " && ollama pull ")
+            if !reachable {
+                return companionManager.isOllamaInstalled ? "Tap below to start it." : "Tap below to download it."
+            }
+            return "Missing: " + missing.joined(separator: ", ") + " — add it below."
         }()
 
         return Button(action: {

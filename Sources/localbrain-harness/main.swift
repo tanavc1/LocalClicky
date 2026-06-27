@@ -620,6 +620,16 @@ func runSelfTest() -> Never {
     check("autotune parse: nil when no model id",
           AutotuneBridge.parseRecommendedModel(from: "no models here, just text", installed: []) == nil)
 
+    // --- Ollama pull progress parsing ---
+    let (pp1, pe1) = OllamaClient.parsePullLine("{\"status\":\"downloading\",\"completed\":50,\"total\":100}")
+    check("pull parse: 50% fraction", pp1?.fraction == 0.5 && pe1 == nil)
+    let (pp2, _) = OllamaClient.parsePullLine("{\"status\":\"success\"}")
+    check("pull parse: success → complete", pp2?.isComplete == true)
+    let (pp3, pe3) = OllamaClient.parsePullLine("{\"error\":\"model 'nope' not found\"}")
+    check("pull parse: error surfaced", pp3 == nil && pe3 == "model 'nope' not found")
+    let (pp4, _) = OllamaClient.parsePullLine("   ")
+    check("pull parse: blank line ignored", pp4 == nil)
+
     print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER + ADVISOR + AGENT TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
     exit(failures == 0 ? 0 : 1)
 }
