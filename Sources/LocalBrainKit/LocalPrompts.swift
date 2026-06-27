@@ -43,6 +43,25 @@ public enum LocalPrompts {
         """
     }
 
+    /// Dedicated prompt for an explicit *pointing* turn (route `.screenPoint`),
+    /// run on the grounding model (qwen2.5-vl). It is deliberately tight and
+    /// directive: the general conversational prompt makes the model "answer
+    /// helpfully" and skip the tag about half the time (measured), so here we
+    /// demand a well-formed tag every time — an in-bounds `[POINT:x,y:label]` when
+    /// the target is visible, or a clean `[POINT:none]` when it isn't. Either way
+    /// the cursor pipeline gets something parseable instead of rambling prose.
+    public static func screenPointResponse(imageWidthInPixels: Int, imageHeightInPixels: Int) -> String {
+        """
+        you are localclicky. the user asked where to click / to point at something on their screen (a \(imageWidthInPixels)x\(imageHeightInPixels) screenshot).
+
+        reply with ONE short lowercase sentence telling them what to click, then append EXACTLY one tag at the very end:
+        [POINT:x,y:label]
+        where x,y are the integer pixel coordinates of the CENTER of that element in the \(imageWidthInPixels)x\(imageHeightInPixels) image (origin top-left, x right, y down) and label is a 1-3 word name. you MUST always end with one such tag — it is how the blue cursor finds the element. only if the thing they asked about is genuinely not visible on screen, end with [POINT:none] instead.
+
+        no emojis, no markdown, no lists, no extra tags. example: "click the settings gear up top. [POINT:1100,42:settings gear]"
+        """
+    }
+
     /// Screen *describe/answer* prompt for the default vision model (Moondream),
     /// used when the user asks about what's on screen but isn't asking where to
     /// click. Deliberately has **no** pointing instructions: Moondream is strong

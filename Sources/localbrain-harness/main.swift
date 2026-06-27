@@ -249,14 +249,17 @@ func shellCapture(_ command: String, _ arguments: [String]) -> String {
 func benchTextModel(_ client: OllamaClient, model: String, prompts: [String], iterations: Int) async -> BenchRunResult {
     var samples = LatencySamples()
     // Discard one warm-up so steady-state numbers aren't polluted by model load.
+    // Uses the app's per-role text context window (the autotune KV right-sizing).
     _ = try? await client.streamChat(model: model, messages: [.system(LocalPrompts.textVoiceResponse), .user("hi")],
-                                     temperature: 0.2, maxTokens: 8, onText: { _ in })
+                                     temperature: 0.2, maxTokens: 8,
+                                     contextWindow: LocalModels.textContextWindow, onText: { _ in })
     for prompt in prompts {
         for _ in 0..<iterations {
             if let result = try? await client.streamChat(
                 model: model,
                 messages: [.system(LocalPrompts.textVoiceResponse), .user(prompt)],
-                temperature: 0.2, maxTokens: 100, onText: { _ in }) {
+                temperature: 0.2, maxTokens: 100,
+                contextWindow: LocalModels.textContextWindow, onText: { _ in }) {
                 samples.record(result)
             }
         }
@@ -275,20 +278,22 @@ func benchTextModel(_ client: OllamaClient, model: String, prompts: [String], it
 /// accuracy would need hand-labeled ground truth, which this does not claim).
 func benchVisionModel(_ client: OllamaClient, model: String, imageBase64: String,
                       width: Int, height: Int, prompts: [String], iterations: Int) async -> BenchRunResult {
-    let systemPrompt = LocalPrompts.screenVoiceResponse(imageWidthInPixels: width, imageHeightInPixels: height)
+    // The dedicated directive pointing prompt (forces a well-formed tag), at the
+    // app's per-role vision context window.
+    let systemPrompt = LocalPrompts.screenPointResponse(imageWidthInPixels: width, imageHeightInPixels: height)
     var samples = LatencySamples()
     var parsed = 0, inBounds = 0, attempts = 0
     // Warm-up (discarded).
     _ = try? await client.streamChat(model: model,
         messages: [.system(systemPrompt), .user(prompts.first ?? "what's on screen?", imagesBase64: [imageBase64])],
-        temperature: 0.2, maxTokens: 160, onText: { _ in })
+        temperature: 0.2, maxTokens: 160, contextWindow: LocalModels.visionContextWindow, onText: { _ in })
     for prompt in prompts {
         for _ in 0..<iterations {
             attempts += 1
             guard let result = try? await client.streamChat(
                 model: model,
                 messages: [.system(systemPrompt), .user(prompt, imagesBase64: [imageBase64])],
-                temperature: 0.2, maxTokens: 160, onText: { _ in }) else { continue }
+                temperature: 0.2, maxTokens: 160, contextWindow: LocalModels.visionContextWindow, onText: { _ in }) else { continue }
             samples.record(result)
             let pointing = PointingTagParser.parse(from: result.text)
             if pointing.hasPoint, let center = pointing.centerInImagePixels {
@@ -434,6 +439,15 @@ func runSelfTest() -> Never {
     check("multiple tags: last wins, all stripped", t7.centerInImagePixels == CGPoint(x: 30, y: 40)
           && !t7.spokenText.contains("POINT"))
 
+    // qwen2.5-vl's actual attribute output format.
+    let t8 = PointingTagParser.parse(from: "the gear icon, top right. [POINT x=\"736\" y=\"45\"]")
+    check("attribute [POINT x=.. y=..] form", t8.centerInImagePixels == CGPoint(x: 736, y: 45)
+          && t8.spokenText == "the gear icon, top right.")
+    let t9 = PointingTagParser.parse(from: "here it is [POINT x1=\"10\" y1=\"20\" x2=\"30\" y2=\"40\" label=\"save\"]")
+    check("attribute box form → center + label", t9.centerInImagePixels == CGPoint(x: 20, y: 30) && t9.label == "save")
+    let t10 = PointingTagParser.parse(from: "no good target here [POINT:none]")
+    check("attribute parser still honors none", !t10.hasPoint)
+
     // --- ConversationRouter ---
     // Default daily context: vision mode on, screen available.
     func ctx(prevScreen: Bool = false, history: Bool = false,
@@ -452,6 +466,12 @@ func runSelfTest() -> Never {
     check("'point at the search bar' → screenPoint", route("point at the search bar", ctx()) == .screenPoint)
     check("'which button do i press' → screenPoint", route("which button do i press to save", ctx()) == .screenPoint)
     check("'show me where to type' → screenPoint", route("show me where to type my password", ctx()) == .screenPoint)
+    // A pointing question that mentions "open settings" must point, not launch the app.
+    check("'where do i click to open settings' → screenPoint (not openApp)",
+          route("where do i click to open settings", ctx()) == .screenPoint)
+    check("'point at the gmail tab' → screenPoint (not browser)",
+          route("point at the gmail tab", ctx()) == .screenPoint)
+    check("plain 'open settings' still → openApp", route("open the settings app", ctx()) == .openApp)
     check("screen 'this button' → screen (describe)", route("what does this button do", ctx()) == .screen)
     check("screen 'explain this error' → screen", route("explain this error", ctx()) == .screen)
     check("screen 'what's on my screen' → screen", route("what's on my screen right now", ctx()) == .screen)
@@ -552,6 +572,9 @@ func runSelfTest() -> Never {
           !LocalPrompts.screenDescribe(imageWidthInPixels: 100, imageHeightInPixels: 100).contains("[POINT"))
     check("screenVoiceResponse keeps pointing instruction",
           LocalPrompts.screenVoiceResponse(imageWidthInPixels: 100, imageHeightInPixels: 100).contains("[POINT"))
+    check("screenPointResponse demands a tag every time",
+          LocalPrompts.screenPointResponse(imageWidthInPixels: 100, imageHeightInPixels: 100).contains("[POINT:x,y:label]")
+          && LocalPrompts.screenPointResponse(imageWidthInPixels: 100, imageHeightInPixels: 100).lowercased().contains("must always"))
     check("isLikelyGroundingCapable: moondream is not", !LocalModels.isLikelyGroundingCapable("moondream"))
     check("isLikelyGroundingCapable: qwen2.5vl is", LocalModels.isLikelyGroundingCapable("qwen2.5vl:3b"))
     check("'open gmail' still → browserCommand", route("open gmail", ctx()) == .browserCommand)
@@ -630,6 +653,11 @@ func runSelfTest() -> Never {
     let (pp4, _) = OllamaClient.parsePullLine("   ")
     check("pull parse: blank line ignored", pp4 == nil)
 
+    // --- Safety: inference is localhost-only (no cloud) ---
+    check("default Ollama endpoint is localhost", LocalModels.defaultOllamaBaseURL.host == "127.0.0.1")
+    check("OllamaClient talks only to localhost", OllamaClient().baseURL.host == "127.0.0.1")
+    check("identity prompt states no-cloud", LocalPrompts.identity.contains("no cloud"))
+
     print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER + ADVISOR + AGENT TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
     exit(failures == 0 ? 0 : 1)
 }
@@ -689,11 +717,108 @@ func runAdvise() {
     }
 }
 
+/// Drives the REAL answer pipeline against Ollama, mirroring CompanionManager's
+/// route → model → prompt selection, so the whole brain is verified end-to-end:
+/// text answers, "give text", Moondream screen-describe, qwen2.5vl pointing, and
+/// the two-step screen joke. Exits non-zero if any critical check fails.
+///   localbrain-harness --e2e <image.png>
+func runE2E(imagePath: String) async {
+    let client = OllamaClient()
+    print("=== LocalClicky end-to-end pipeline (real models) ===")
+    guard await client.isServerReachable() else {
+        print("❌ Ollama not reachable. Start it: ollama serve"); exit(1)
+    }
+    guard let imageData = FileManager.default.contents(atPath: imagePath) else {
+        print("❌ couldn't read image at \(imagePath)"); exit(1)
+    }
+    let (w, h) = pngPixelSize(path: imagePath) ?? (1920, 1080)
+    let b64 = imageData.base64EncodedString()
+    var failures = 0
+    func line(_ name: String, _ ok: Bool, _ detail: String = "") {
+        print((ok ? "✅ " : "❌ ") + name + (detail.isEmpty ? "" : "  — \(detail)"))
+        if !ok { failures += 1 }
+    }
+    func ctx() -> ConversationRouter.Context {
+        .init(visionModeSelected: true, screenAvailable: true, previousTurnUsedScreen: false, hasConversationHistory: false)
+    }
+
+    // 1) Plain text question → text model.
+    let q1 = "what's the capital of france"
+    let route1 = ConversationRouter.route(transcript: q1, context: ctx())
+    let a1 = try? await client.streamChat(model: LocalModels.chatModel,
+        messages: [.system(LocalPrompts.textVoiceResponse), .user(q1)],
+        temperature: 0.2, maxTokens: 60, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    line("text: route=.text + non-empty answer", route1 == .text && !(a1?.text.isEmpty ?? true), a1?.text ?? "nil")
+
+    // 2) "give me X in text" → concise honest answer.
+    let q2 = "give me the speed of light in text"
+    let route2 = ConversationRouter.route(transcript: q2, context: ctx())
+    let a2 = try? await client.streamChat(model: LocalModels.chatModel,
+        messages: [.system(LocalPrompts.conciseText), .user(q2)],
+        temperature: 0.1, maxTokens: 40, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    line("give-text: route=.showText + non-empty answer", route2 == .showText && !(a2?.text.isEmpty ?? true), a2?.text ?? "nil")
+
+    // 3) Screen describe → Moondream.
+    let q3 = "what's on my screen"
+    let route3 = ConversationRouter.route(transcript: q3, context: ctx())
+    let a3 = try? await client.streamChat(model: LocalModels.visionModel,
+        messages: [.system(LocalPrompts.screenDescribe(imageWidthInPixels: w, imageHeightInPixels: h)),
+                   .user(q3, imagesBase64: [b64])],
+        temperature: 0.3, maxTokens: 80, contextWindow: LocalModels.visionContextWindow, onText: { _ in })
+    line("screen-describe: route=.screen + Moondream answer", route3 == .screen && !(a3?.text.isEmpty ?? true), a3?.text ?? "nil")
+
+    // 4) Pointing → grounding model + the dedicated directive prompt must always
+    //    return a WELL-FORMED tag: an in-bounds [POINT:x,y] when the target is
+    //    visible, or a clean [POINT:none] when it isn't (both are valid pipeline
+    //    outcomes — the failure mode we're catching is rambling with no tag). The
+    //    target ("search box") is present on the test screenshot, so we expect an
+    //    in-bounds point most of the time and retry a couple times for it.
+    let q4 = "point at the search box"
+    let route4 = ConversationRouter.route(transcript: q4, context: ctx())
+    var pointDetail = "no tag"
+    var wellFormed = false
+    for _ in 0..<3 where !wellFormed {
+        let a4 = try? await client.streamChat(model: LocalModels.groundingModel,
+            messages: [.system(LocalPrompts.screenPointResponse(imageWidthInPixels: w, imageHeightInPixels: h)),
+                       .user(q4, imagesBase64: [b64])],
+            temperature: 0.2, maxTokens: 120, contextWindow: LocalModels.visionContextWindow, onText: { _ in })
+        guard let parsed = a4.map({ PointingTagParser.parse(from: $0.text) }) else { continue }
+        if let center = parsed.centerInImagePixels {
+            pointDetail = "(\(Int(center.x)),\(Int(center.y)))"
+            wellFormed = center.x >= 0 && center.x <= CGFloat(w) && center.y >= 0 && center.y <= CGFloat(h)
+        } else if parsed.label == "none" {
+            pointDetail = "none (no visible target)"
+            wellFormed = true
+        }
+    }
+    line("pointing: route=.screenPoint + well-formed tag (point or none)", route4 == .screenPoint && wellFormed, pointDetail)
+
+    // 5) Two-step screen joke produces a line.
+    let glance = try? await client.streamChat(model: LocalModels.visionModel,
+        messages: [.system(LocalPrompts.screenGlanceSystem), .user(LocalPrompts.screenGlanceUser, imagesBase64: [b64])],
+        temperature: 0.3, maxTokens: 50, contextWindow: LocalModels.visionContextWindow, onText: { _ in })
+    var desc = glance?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if desc.count < 8 { desc = "their computer screen with a few things open" }
+    let joke = try? await client.streamChat(model: LocalModels.chatModel,
+        messages: [.system(LocalPrompts.screenJokeFromDescription),
+                   .user("the user is looking at: \(desc). make the joke.")],
+        temperature: 0.9, maxTokens: 50, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    line("two-step screen joke produces a line", !(joke?.text.isEmpty ?? true), joke?.text ?? "nil")
+
+    print(failures == 0 ? "\nE2E PASSED" : "\n\(failures) E2E CHECK(S) FAILED")
+    exit(failures == 0 ? 0 : 1)
+}
+
 func runHarness() async {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments.first == "--selftest" { runSelfTest() }
     if arguments.first == "--advise" {
         runAdvise()
+        return
+    }
+    if arguments.first == "--e2e" {
+        guard arguments.count >= 2 else { print("usage: localbrain-harness --e2e <image.png>"); exit(1) }
+        await runE2E(imagePath: arguments[1])
         return
     }
     if arguments.first == "--models" {

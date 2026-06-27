@@ -894,7 +894,7 @@ final class CompanionManager: ObservableObject {
                         // describe instead of asking it for empty coordinates.
                         let pointingModel = resolvedGroundingModelName()
                         if LocalModels.isLikelyGroundingCapable(pointingModel) {
-                            systemPrompt = LocalPrompts.screenVoiceResponse(
+                            systemPrompt = LocalPrompts.screenPointResponse(
                                 imageWidthInPixels: capture.screenshotWidthInPixels,
                                 imageHeightInPixels: capture.screenshotHeightInPixels)
                         } else {

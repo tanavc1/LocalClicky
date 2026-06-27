@@ -74,18 +74,26 @@ public enum ConversationRouter {
     public static func route(transcript: String, context: Context) -> ConversationRoute {
         let text = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // A "where do I click…/point at…" question is about the screen, even when
+        // it mentions "open settings" or a site name — so detect it first and
+        // don't let the app/browser launcher hijack a pointing question (e.g.
+        // "where do i click to open settings" must point, not launch Settings).
+        let isPointingQuestion = wantsPointing(text)
+
         // 1) Deterministic action requests win over questions, in order of how
-        //    unambiguous they are:
+        //    unambiguous they are — but never over a pointing question.
         //    a) "copy your answer to the clipboard" — refers to what we just said.
         if wantsCopyLastAnswer(text) { return .copyLastAnswer }
         //    a2) "give me X in text" / "give text" — answer in the blue side-text.
         if wantsShowText(text) { return .showText }
-        //    b) "launch spotify" / "open the notes app" — open an installed app.
-        //       Checked before the browser so explicit app phrasing isn't read as
-        //       a website (e.g. "launch spotify" opens the app, not spotify.com).
-        if AppCommandPlanner.isAppLaunch(text) { return .openApp }
-        //    c) "open a new tab and go to gmail" — navigate the browser.
-        if isBrowserCommand(text) { return .browserCommand }
+        if !isPointingQuestion {
+            //    b) "launch spotify" / "open the notes app" — open an installed app.
+            //       Checked before the browser so explicit app phrasing isn't read
+            //       as a website (e.g. "launch spotify" opens the app, not the site).
+            if AppCommandPlanner.isAppLaunch(text) { return .openApp }
+            //    c) "open a new tab and go to gmail" — navigate the browser.
+            if isBrowserCommand(text) { return .browserCommand }
+        }
 
         // 2) No screen this turn (text-only mode, or no permission) → text path.
         guard context.visionModeSelected, context.screenAvailable else { return .text }
@@ -96,7 +104,7 @@ public enum ConversationRouter {
         // 4) Distinguish "point at / where do I click" (needs grounding coords)
         //    from "describe / what's on screen" (the default vision model). The
         //    two use different models + prompts since Moondream can't ground.
-        if wantsPointing(text) { return .screenPoint }
+        if isPointingQuestion { return .screenPoint }
         return .screen
     }
 
