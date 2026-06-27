@@ -65,6 +65,17 @@ public enum LocalModels {
     /// being cheap on a 3B model's KV cache.
     public static let defaultContextWindow = 8192
 
+    /// Per-role context windows (the autotune "right-size the KV cache" idea). A
+    /// pure text turn rarely needs more than this, and a smaller `num_ctx` means
+    /// a smaller KV cache → faster prefill (lower time-to-first-word) and less
+    /// RAM. Vision turns keep the roomy window because a screenshot plus history
+    /// is token-heavy. This is reload-safe as long as a *given model* always gets
+    /// the same value (see `CompanionManager.contextWindow(forModel:)`): text and
+    /// vision are normally different models, and when one model fills both roles
+    /// it gets the vision window in both.
+    public static let textContextWindow = 4096
+    public static let visionContextWindow = 8192
+
     /// Default local Ollama endpoint. Overridable so a user running Ollama on a
     /// non-standard port can point the app at it.
     public static let defaultOllamaBaseURL = URL(string: "http://127.0.0.1:11434")!

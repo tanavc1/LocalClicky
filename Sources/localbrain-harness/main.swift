@@ -590,7 +590,37 @@ func runSelfTest() -> Never {
     check("missing model not matched",
           !OllamaClient.modelInstalled("mistral:7b", among: ["llama3.2:3b"]))
 
-    print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER + AGENT TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
+    // --- HardwareAdvisor (recommendation is a pure function of the profile) ---
+    func profile(total: Double, avail: Double) -> HardwareProfile {
+        HardwareProfile(totalRAMGB: total, availableRAMGB: avail, physicalCores: 8, isAppleSilicon: true)
+    }
+    let rec16 = HardwareAdvisor.recommend(for: profile(total: 16, avail: 6.3))
+    check("16GB → llama3.2:3b text", rec16.chatModel == "llama3.2:3b")
+    check("16GB → moondream vision", rec16.visionModel == "moondream")
+    check("16GB → qwen2.5vl grounding", rec16.groundingModel == "qwen2.5vl:3b")
+    check("16GB keeps text+vision resident",
+          rec16.residentModels.contains("llama3.2:3b") && rec16.residentModels.contains("moondream"))
+    check("16GB does NOT keep grounding resident (tight)", !rec16.keepsGroundingResident)
+    let rec32 = HardwareAdvisor.recommend(for: profile(total: 32, avail: 24))
+    check("32GB → stronger coder text", rec32.chatModel == "qwen2.5-coder:7b")
+    check("32GB → qwen3-vl grounding", rec32.groundingModel == "qwen3-vl:8b")
+    check("32GB keeps grounding resident", rec32.keepsGroundingResident)
+    let rec4 = HardwareAdvisor.recommend(for: profile(total: 4, avail: 2))
+    check("4GB → tiny 1b text", rec4.chatModel == "llama3.2:1b")
+    check("fits(): moondream alone fits 6GB", HardwareAdvisor.fits(["moondream"], inBudgetGB: 6))
+    check("fits(): three big models don't fit 6GB",
+          !HardwareAdvisor.fits(["llama3.2:3b", "moondream", "qwen2.5vl:3b"], inBudgetGB: 6))
+    check("catalog: moondream known", ModelCatalog.model(named: "moondream") != nil)
+    check("catalog: unknown model → safe residentGB estimate", ModelCatalog.residentGB(of: "mystery:99b") == 4.0)
+
+    // --- AutotuneBridge: tolerant model-id parsing ---
+    let sample = "Recommended (balanced): qwen2.5-coder:7b — MMLU 84%, fits in 6.2 GB. Runs at 9:30."
+    check("autotune parse: picks model id, not the time",
+          AutotuneBridge.parseRecommendedModel(from: sample, installed: []) == "qwen2.5-coder:7b")
+    check("autotune parse: nil when no model id",
+          AutotuneBridge.parseRecommendedModel(from: "no models here, just text", installed: []) == nil)
+
+    print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER + ADVISOR + AGENT TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
     exit(failures == 0 ? 0 : 1)
 }
 
@@ -623,9 +653,39 @@ func runModelList() async {
     print("Vision role default: \(LocalModels.defaultVisionModel)")
 }
 
+/// Prints the native hardware profile + the advisor's model recommendation, plus
+/// whether the optional autotune CLI is installed (the hybrid path).
+func runAdvise() {
+    let profile = HardwareAdvisor.detect()
+    print("=== LocalClicky hardware advisor ===")
+    print("Hardware: \(profile.summary)")
+    print(String(format: "  total RAM: %.1f GB  ·  available now: %.1f GB", profile.totalRAMGB, profile.availableRAMGB))
+    let rec = HardwareAdvisor.recommend(for: profile)
+    print("\nRecommended for this machine:")
+    print("  text:      \(rec.chatModel)")
+    print("  vision:    \(rec.visionModel)")
+    print("  grounding: \(rec.groundingModel)")
+    print("  resident set (kept warm): \(rec.residentModels.joined(separator: ", "))")
+    print("  grounding stays resident: \(rec.keepsGroundingResident)   keep_alive: \(rec.keepAlive)")
+    print("  → \(rec.summary)")
+
+    print("\nautotune CLI (hybrid):")
+    let status = AutotuneBridge.quickStatus()
+    if status.isInstalled {
+        print("  installed at \(status.executablePath ?? "?")  \(status.version ?? "")")
+        print("  (run `autotune recommend` for its full machine-measured suggestion)")
+    } else {
+        print("  not installed — using the native advisor (this is fine).")
+    }
+}
+
 func runHarness() async {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments.first == "--selftest" { runSelfTest() }
+    if arguments.first == "--advise" {
+        runAdvise()
+        return
+    }
     if arguments.first == "--models" {
         await runModelList()
         return

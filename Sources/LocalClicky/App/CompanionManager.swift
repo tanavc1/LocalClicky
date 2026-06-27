@@ -67,6 +67,15 @@ final class CompanionManager: ObservableObject {
     /// next push-to-talk begins.
     @Published private(set) var lastResponseLatencyDescription: String?
 
+    /// The detected hardware + the advisor's recommendation for this machine
+    /// (drives the resident-model set, keep_alive, and the Phase 5 blue-text
+    /// recommendation). Refreshed at launch.
+    @Published private(set) var hardwareProfile: HardwareProfile = HardwareAdvisor.detect()
+    @Published private(set) var hardwareRecommendation: ModelRecommendation = HardwareAdvisor.recommendForThisMachine()
+    /// Whether the optional `autotune` CLI is installed (hybrid mode). The app is
+    /// fully functional without it; when present it enriches the recommendation.
+    @Published private(set) var autotuneStatus: AutotuneStatus = .notInstalled
+
     /// Whether the local Ollama server is reachable. Drives the panel nudge to
     /// start Ollama if it isn't running.
     @Published private(set) var isLocalEngineReachable = true
@@ -213,6 +222,7 @@ final class CompanionManager: ObservableObject {
         // Pay one-time warm-up costs now, in the background, so the user's first
         // interaction is snappy: the neural voice's inference graph, and both
         // Ollama models loaded and resident (keep_alive keeps them warm).
+        refreshHardwareRecommendation()
         speechSynthesizer.warmUp()
         warmUpLocalModels()
         refreshInstalledModels()
@@ -246,19 +256,57 @@ final class CompanionManager: ObservableObject {
     /// roles) so Ollama never reloads a model for a different num_ctx — which also
     /// matters when one model is picked for both roles.
     private func warmUpLocalModels() {
-        // De-dupe in case the same model fills both roles.
-        let models = Array(Set([chatModelName, visionModelName]))
+        // Warm the models the app will actually use, each at the context window
+        // it will be called with (so Ollama never reloads it for a different
+        // num_ctx) and with the advisor's keep_alive so they stay resident. The
+        // grounding model is warmed too only when the advisor says it fits
+        // alongside the others — otherwise it loads on demand for pointing turns.
+        var toWarm: [(model: String, ctx: Int)] = [
+            (chatModelName, contextWindow(forModel: chatModelName)),
+            (visionModelName, contextWindow(forModel: visionModelName)),
+        ]
+        if hardwareRecommendation.keepsGroundingResident {
+            toWarm.append((groundingModelName, contextWindow(forModel: groundingModelName)))
+        }
+        var seen = Set<String>()
+        let unique = toWarm.filter { seen.insert($0.model).inserted }
+        let keepAlive = hardwareRecommendation.keepAlive
         Task.detached(priority: .utility) { [ollamaClient] in
-            for model in models {
+            for entry in unique {
                 _ = try? await ollamaClient.streamChat(
-                    model: model,
+                    model: entry.model,
                     messages: [.user("hi")],
                     temperature: 0.0,
                     maxTokens: 1,
-                    contextWindow: LocalModels.defaultContextWindow,
+                    keepAlive: keepAlive,
+                    contextWindow: entry.ctx,
                     onText: { _ in }
                 )
             }
+        }
+    }
+
+    /// The context window to use for a given model. Vision/grounding models get
+    /// the roomy window (screenshot + history); a pure text model gets a snug one
+    /// (faster prefill, less KV RAM). Checking against the *current* role models
+    /// keeps it reload-safe: a model always gets one consistent value, including
+    /// when a single VLM fills both the text and vision roles.
+    private func contextWindow(forModel model: String) -> Int {
+        if model == visionModelName || model == groundingModelName {
+            return LocalModels.visionContextWindow
+        }
+        return LocalModels.textContextWindow
+    }
+
+    /// Recomputes the hardware profile + recommendation, and (in the background)
+    /// detects the optional autotune CLI. Cheap; safe to call on launch and after
+    /// the user changes models.
+    func refreshHardwareRecommendation() {
+        hardwareProfile = HardwareAdvisor.detect()
+        hardwareRecommendation = HardwareAdvisor.recommend(for: hardwareProfile)
+        Task.detached(priority: .utility) {
+            let status = AutotuneBridge.quickStatus()
+            await MainActor.run { self.autotuneStatus = status }
         }
     }
 
@@ -732,7 +780,8 @@ final class CompanionManager: ObservableObject {
                     messages: messages,
                     temperature: cursorScreenCapture == nil ? 0.7 : 0.3,
                     maxTokens: cursorScreenCapture == nil ? 220 : 180,
-                    contextWindow: LocalModels.defaultContextWindow,
+                    keepAlive: hardwareRecommendation.keepAlive,
+                    contextWindow: contextWindow(forModel: model),
                     onText: { accumulated in
                         let speakable = SpokenTextSegmenter.speakablePrefix(accumulated)
                         if let (sentence, _) = speechProgress.advance(speakable: speakable) {
@@ -912,7 +961,8 @@ final class CompanionManager: ObservableObject {
                 messages: [.system(LocalPrompts.conciseText), .user(transcript)],
                 temperature: 0.2,
                 maxTokens: 64,
-                contextWindow: LocalModels.defaultContextWindow,
+                keepAlive: hardwareRecommendation.keepAlive,
+                contextWindow: contextWindow(forModel: chatModelName),
                 onText: { _ in })
             answer = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch is CancellationError {
@@ -988,7 +1038,8 @@ final class CompanionManager: ObservableObject {
                              imagesBase64: [capture.imageData.base64EncodedString()])],
             temperature: 0.3,
             maxTokens: 60,
-            contextWindow: LocalModels.defaultContextWindow,
+            keepAlive: hardwareRecommendation.keepAlive,
+            contextWindow: contextWindow(forModel: visionModelName),
             onText: { _ in })
         var description = glance?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // The small vision model occasionally returns empty/garbage; fall back to
@@ -1002,7 +1053,8 @@ final class CompanionManager: ObservableObject {
                        .user("the user is looking at: \(description). make the joke.")],
             temperature: 0.9,
             maxTokens: 50,
-            contextWindow: LocalModels.defaultContextWindow,
+            keepAlive: hardwareRecommendation.keepAlive,
+            contextWindow: contextWindow(forModel: chatModelName),
             onText: { _ in })
         return joke?.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
