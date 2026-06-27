@@ -89,6 +89,10 @@ public enum OllamaError: Error, LocalizedError {
 public final class OllamaClient: @unchecked Sendable {
     public let baseURL: URL
     private let session: URLSession
+    /// A separate session for model downloads (`/api/pull`), which can stream for
+    /// many minutes on a multi-GB model. The default session's resource timeout
+    /// would abort such a download, so pulls get very generous timeouts instead.
+    private let pullSession: URLSession
 
     public init(baseURL: URL = LocalModels.defaultOllamaBaseURL) {
         self.baseURL = baseURL
@@ -102,6 +106,13 @@ public final class OllamaClient: @unchecked Sendable {
         configuration.waitsForConnectivity = false
         configuration.urlCache = nil
         self.session = URLSession(configuration: configuration)
+
+        let pullConfiguration = URLSessionConfiguration.default
+        pullConfiguration.timeoutIntervalForRequest = 600       // 10 min between bytes
+        pullConfiguration.timeoutIntervalForResource = 7200     // up to 2 h total (big models)
+        pullConfiguration.waitsForConnectivity = false
+        pullConfiguration.urlCache = nil
+        self.pullSession = URLSession(configuration: pullConfiguration)
     }
 
     // MARK: - Health
@@ -212,6 +223,76 @@ public final class OllamaClient: @unchecked Sendable {
             return []
         }
         return Set(capabilities)
+    }
+
+    // MARK: - Model download (/api/pull)
+
+    /// Progress for an in-flight `ollama pull`. `fraction` is 0…1 when byte
+    /// counts are known (the big "downloading" layers), else 0 during the
+    /// manifest/verify phases.
+    public struct PullProgress: Sendable, Equatable {
+        public let status: String
+        public let completedBytes: Int64
+        public let totalBytes: Int64
+        public var fraction: Double {
+            totalBytes > 0 ? min(1.0, max(0.0, Double(completedBytes) / Double(totalBytes))) : 0
+        }
+        public var isComplete: Bool { status.lowercased().contains("success") }
+    }
+
+    /// Parses one newline-delimited JSON object from `/api/pull` into progress.
+    /// Pure + static so it can be unit-tested from the harness. Returns nil for
+    /// blank lines / unparseable input, and throws via the returned error string.
+    public static func parsePullLine(_ line: String) -> (progress: PullProgress?, error: String?) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (nil, nil)
+        }
+        if let error = obj["error"] as? String { return (nil, error) }
+        let status = obj["status"] as? String ?? ""
+        let completed = (obj["completed"] as? NSNumber)?.int64Value ?? 0
+        let total = (obj["total"] as? NSNumber)?.int64Value ?? 0
+        return (PullProgress(status: status, completedBytes: completed, totalBytes: total), nil)
+    }
+
+    /// Downloads (pulls) a model into Ollama, streaming progress. The stream
+    /// finishes when the pull succeeds, or throws on error (incl. server
+    /// unreachable). Cancelling the consuming task cancels the download.
+    public func pullModel(_ name: String) -> AsyncThrowingStream<PullProgress, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var request = URLRequest(url: baseURL.appendingPathComponent("api/pull"))
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = try JSONSerialization.data(withJSONObject: ["model": name, "stream": true])
+
+                    let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+                    do {
+                        (bytes, response) = try await pullSession.bytes(for: request)
+                    } catch {
+                        throw OllamaError.serverUnreachable
+                    }
+                    guard let http = response as? HTTPURLResponse else {
+                        throw OllamaError.malformedResponse("no HTTP response")
+                    }
+                    guard http.statusCode == 200 else {
+                        throw OllamaError.httpStatus(http.statusCode, "pull failed")
+                    }
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        let parsed = Self.parsePullLine(line)
+                        if let error = parsed.error { throw OllamaError.httpStatus(500, error) }
+                        if let progress = parsed.progress { continuation.yield(progress) }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
     }
 
     // MARK: - Streaming chat

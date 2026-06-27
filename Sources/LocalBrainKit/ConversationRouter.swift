@@ -25,7 +25,13 @@
 import Foundation
 
 public enum ConversationRoute: Equatable, Sendable {
+    /// Capture the screen and *describe/answer* about it (the default vision
+    /// model, e.g. Moondream). No coordinates expected.
     case screen
+    /// Capture the screen and *point* at a UI element — the user asked where to
+    /// click / find something. Routed to the grounding model (e.g. qwen2.5vl)
+    /// which returns the pixel coordinates that fly the blue cursor.
+    case screenPoint
     case text
     case browserCommand
     /// Open / launch a local macOS application ("launch spotify", "open the
@@ -34,6 +40,13 @@ public enum ConversationRoute: Equatable, Sendable {
     /// Copy the companion's last spoken answer to the clipboard ("copy your
     /// answer", "put that on my clipboard").
     case copyLastAnswer
+    /// Show a concise, honest answer in the blue side-text beside the cursor
+    /// ("give me X in text", "give text", "show me the text").
+    case showText
+    /// Answer a question that needs the live internet ("look it up online",
+    /// "what's the latest…"). Fetches + synthesizes via WebReachTool. This is the
+    /// one route that leaves the no-cloud guarantee, so it's narrowly triggered.
+    case webReach
 }
 
 public enum ConversationRouter {
@@ -65,16 +78,30 @@ public enum ConversationRouter {
     public static func route(transcript: String, context: Context) -> ConversationRoute {
         let text = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // A "where do I click…/point at…" question is about the screen, even when
+        // it mentions "open settings" or a site name — so detect it first and
+        // don't let the app/browser launcher hijack a pointing question (e.g.
+        // "where do i click to open settings" must point, not launch Settings).
+        let isPointingQuestion = wantsPointing(text)
+
         // 1) Deterministic action requests win over questions, in order of how
-        //    unambiguous they are:
+        //    unambiguous they are — but never over a pointing question.
         //    a) "copy your answer to the clipboard" — refers to what we just said.
         if wantsCopyLastAnswer(text) { return .copyLastAnswer }
-        //    b) "launch spotify" / "open the notes app" — open an installed app.
-        //       Checked before the browser so explicit app phrasing isn't read as
-        //       a website (e.g. "launch spotify" opens the app, not spotify.com).
-        if AppCommandPlanner.isAppLaunch(text) { return .openApp }
-        //    c) "open a new tab and go to gmail" — navigate the browser.
-        if isBrowserCommand(text) { return .browserCommand }
+        //    a2) "give me X in text" / "give text" — answer in the blue side-text.
+        if wantsShowText(text) { return .showText }
+        if !isPointingQuestion {
+            //    a3) "look it up online" / "what's the latest…" — fetch from the
+            //        web and answer. Checked before the browser so "search the web
+            //        and tell me" gets an answer instead of just opening a tab.
+            if wantsWebReach(text) { return .webReach }
+            //    b) "launch spotify" / "open the notes app" — open an installed app.
+            //       Checked before the browser so explicit app phrasing isn't read
+            //       as a website (e.g. "launch spotify" opens the app, not the site).
+            if AppCommandPlanner.isAppLaunch(text) { return .openApp }
+            //    c) "open a new tab and go to gmail" — navigate the browser.
+            if isBrowserCommand(text) { return .browserCommand }
+        }
 
         // 2) No screen this turn (text-only mode, or no permission) → text path.
         guard context.visionModeSelected, context.screenAvailable else { return .text }
@@ -82,7 +109,40 @@ public enum ConversationRouter {
         // 3) Vision mode with the screen available is the default. Only divert to
         //    the text model when the turn is clearly self-contained.
         if isClearlyTextOnly(text, context: context) { return .text }
+        // 4) Distinguish "point at / where do I click" (needs grounding coords)
+        //    from "describe / what's on screen" (the default vision model). The
+        //    two use different models + prompts since Moondream can't ground.
+        if isPointingQuestion { return .screenPoint }
         return .screen
+    }
+
+    // MARK: - Pointing vs describing
+
+    /// True when the user wants the blue cursor to *point* at something on screen
+    /// (where to click, find a button, etc.) rather than just hear it described.
+    /// Tightly phrased so "what does this button do" stays a describe turn.
+    static func wantsPointing(_ text: String) -> Bool {
+        let pointingPhrases = [
+            "point at", "point to", "point me", "point out", "point the",
+            "show me where", "show me how to get to",
+            "where do i", "where should i", "where can i", "where to click",
+            "where is the", "where's the", "where is it", "where's it", "where are the",
+            "how do i get to", "how do i find",
+            "which button", "which one", "which icon", "which tab", "which option", "which menu",
+            "highlight the", "highlight ",
+        ]
+        if pointingPhrases.contains(where: text.contains) { return true }
+        // Imperative "click ..." that targets a UI element.
+        if text.hasPrefix("click ") || text.contains(" click the") || text.contains(" click on")
+            || text.contains("where do i click") {
+            return true
+        }
+        // A UI noun paired with a find/locate/where cue.
+        let uiNouns = [" button", " menu", " icon", " toolbar", " field", " checkbox",
+                       " dropdown", " text box", " text field", " slider", " tab", " link", " option"]
+        let locateCue = text.contains("find ") || text.contains("locate ") || text.contains("where")
+        if locateCue && uiNouns.contains(where: text.contains) { return true }
+        return false
     }
 
     // MARK: - Clipboard
@@ -105,6 +165,37 @@ public enum ConversationRouter {
             "copy what you said", "copy what you just said", "copy that down",
         ]
         return answerPhrases.contains(where: text.contains)
+    }
+
+    // MARK: - "Give text" (answer in the blue side-text)
+
+    /// True when the user wants the answer shown as text beside the cursor rather
+    /// than (only) spoken: "give me X in text", "give text", "show me the text".
+    static func wantsShowText(_ text: String) -> Bool {
+        if text == "give text" || text.hasPrefix("give text ") || text.hasPrefix("give me text") { return true }
+        let phrases = [
+            " in text", " as text", " in writing", " on text",
+            "show me the text", "show it in text", "put it in text", "type it out",
+            "write it out", "give me the text", "text it to me", "text me the",
+        ]
+        return phrases.contains(where: text.contains)
+    }
+
+    // MARK: - Web reach (the one internet-answering route)
+
+    /// True when the user clearly wants info *from the live internet* answered
+    /// back to them (not just a site opened). Conservative on purpose — this is
+    /// the only route that leaves the no-cloud guarantee, so it must require an
+    /// explicit internet marker, never fire on a plain local question.
+    static func wantsWebReach(_ text: String) -> Bool {
+        let markers = [
+            "online", "on the internet", "on the web", "from the web", "from the internet",
+            "the latest", "latest news", "what's new with", "whats new with",
+            "what does the internet say", "search the internet", "search the web and",
+            "look it up online", "look that up online", "look this up online",
+            "check the web", "check online", "google it and tell", "according to the internet",
+        ]
+        return markers.contains(where: text.contains)
     }
 
     // MARK: - Browser commands

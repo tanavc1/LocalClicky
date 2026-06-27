@@ -51,28 +51,41 @@ public enum PointingTagParser {
     // MARK: - [POINT:...] form
 
     private static func parsePointTag(in response: String) -> PointingTag? {
-        // Grab the inner payload of the LAST [POINT:...] tag, and the full range
-        // of every [POINT:...] tag so we can strip them all from the spoken text.
-        let pattern = #"\[POINT:\s*([^\]]*)\]"#
+        // Match ANY [POINT ...] tag and strip them all from the spoken text. We
+        // accept two shapes the local vision models actually emit:
+        //   • classic  "[POINT:1100,42:color inspector]"
+        //   • attribute "[POINT x=\"736\" y=\"45\"]"  (what qwen2.5-vl emits — its
+        //     pointing output is unreliable if we only accept the colon form).
+        let pattern = #"\[POINT\b[^\]]*\]"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return nil
         }
         let fullRange = NSRange(response.startIndex..., in: response)
         let matches = regex.matches(in: response, range: fullRange)
         guard let lastMatch = matches.last,
-              let innerRange = Range(lastMatch.range(at: 1), in: response) else {
+              let tagRange = Range(lastMatch.range, in: response) else {
             return nil
         }
 
         let spokenText = stripAllTagRanges(matches.map { $0.range }, from: response)
-        let inner = String(response[innerRange]).trimmingCharacters(in: .whitespaces)
+
+        // Inner payload: the tag with its brackets and the leading "POINT" /
+        // optional ":" removed.
+        var inner = String(response[tagRange])
+            .replacingOccurrences(of: "[", with: "")
+            .replacingOccurrences(of: "]", with: "")
+        if let keyword = inner.range(of: #"(?i)^\s*POINT\s*:?"#, options: .regularExpression) {
+            inner.removeSubrange(keyword)
+        }
+        inner = inner.trimmingCharacters(in: .whitespaces)
 
         if inner.lowercased() == "none" || inner.isEmpty {
             return PointingTag(spokenText: spokenText, centerInImagePixels: nil,
                                boundingBoxInImagePixels: nil, label: "none", screenNumber: nil)
         }
 
-        let parsed = parseCoordinatePayload(inner)
+        // Attribute form (x="..", y="..") first; fall back to the colon/comma form.
+        let parsed = parseAttributeCoords(inner) ?? parseCoordinatePayload(inner)
         return PointingTag(
             spokenText: spokenText,
             centerInImagePixels: parsed.center,
@@ -80,6 +93,34 @@ public enum PointingTagParser {
             label: parsed.label,
             screenNumber: parsed.screenNumber
         )
+    }
+
+    /// Parses an attribute-style payload like `x="736" y="45"` or
+    /// `x1="10" y1="20" x2="30" y2="40" label="save"`. Returns nil if there's no
+    /// `x`/`y` attribute (so the caller falls back to the colon/comma parser).
+    private static func parseAttributeCoords(_ inner: String) -> ParsedPayload? {
+        func number(_ key: String) -> Double? {
+            let pattern = "(?i)\\b\(key)\\s*=\\s*\"?(-?\\d+(?:\\.\\d+)?)\"?"
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+            let range = NSRange(inner.startIndex..., in: inner)
+            guard let match = regex.firstMatch(in: inner, range: range),
+                  let group = Range(match.range(at: 1), in: inner) else { return nil }
+            return Double(inner[group])
+        }
+        guard let x = number("x") ?? number("x1"), let y = number("y") ?? number("y1") else { return nil }
+        var result = ParsedPayload()
+        if let x2 = number("x2"), let y2 = number("y2") {
+            result.box = CGRect(x: x, y: y, width: x2 - x, height: y2 - y)
+            result.center = CGPoint(x: (x + x2) / 2, y: (y + y2) / 2)
+        } else {
+            result.center = CGPoint(x: x, y: y)
+        }
+        if let regex = try? NSRegularExpression(pattern: "(?i)\\blabel\\s*=\\s*\"([^\"]+)\""),
+           let match = regex.firstMatch(in: inner, range: NSRange(inner.startIndex..., in: inner)),
+           let group = Range(match.range(at: 1), in: inner) {
+            result.label = String(inner[group])
+        }
+        return result
     }
 
     // MARK: - Bare "[x,y:label]" / "[x1,y1,x2,y2:label]" form

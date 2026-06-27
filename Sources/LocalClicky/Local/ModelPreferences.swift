@@ -19,6 +19,7 @@ import LocalBrainKit
 enum ModelPreferences {
     private static let chatKey = "localClicky.chatModelName"
     private static let visionKey = "localClicky.visionModelName"
+    private static let groundingKey = "localClicky.groundingModelName"
 
     static var chatModel: String {
         get { UserDefaults.standard.string(forKey: chatKey) ?? LocalModels.defaultChatModel }
@@ -28,6 +29,13 @@ enum ModelPreferences {
     static var visionModel: String {
         get { UserDefaults.standard.string(forKey: visionKey) ?? LocalModels.defaultVisionModel }
         set { UserDefaults.standard.set(newValue, forKey: visionKey) }
+    }
+
+    /// The grounding model used for pointing turns (the blue cursor's coordinates).
+    /// Defaults to qwen2.5vl; the default vision model (Moondream) can't ground.
+    static var groundingModel: String {
+        get { UserDefaults.standard.string(forKey: groundingKey) ?? LocalModels.defaultGroundingModel }
+        set { UserDefaults.standard.set(newValue, forKey: groundingKey) }
     }
 
     static func model(for role: ModelRole) -> String {
@@ -44,9 +52,10 @@ enum ModelPreferences {
         }
     }
 
-    /// Restore both roles to LocalClicky's defaults.
+    /// Restore all roles to LocalClicky's defaults.
     static func resetToDefaults() {
         UserDefaults.standard.removeObject(forKey: chatKey)
         UserDefaults.standard.removeObject(forKey: visionKey)
+        UserDefaults.standard.removeObject(forKey: groundingKey)
     }
 }

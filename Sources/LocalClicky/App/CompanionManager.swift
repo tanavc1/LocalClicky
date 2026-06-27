@@ -50,10 +50,31 @@ final class CompanionManager: ObservableObject {
     /// BlueCursorView uses this instead of a random pointer phrase.
     @Published var detectedElementBubbleText: String?
 
+    // MARK: - Blue side-text (cursor-adjacent text, independent of pointing)
+
+    /// Text shown in the blue bubble beside the cursor *without* flying anywhere.
+    /// This is the channel for the first-run intro, the screen-aware joke, the
+    /// "give me X in text" answers, and the autotune model recommendation. nil
+    /// means hidden. BlueCursorView observes it and renders it next to the cursor.
+    @Published var companionSideText: String?
+    @Published var companionSideTextOpacity: Double = 0.0
+    /// Cancels an in-progress side-text streamer (so a new one, or push-to-talk,
+    /// doesn't race a half-finished message).
+    private var sideTextStreamTask: Task<Void, Never>?
+
     /// Provider + first-token latency for the most recent response, shown as a
     /// small badge near the cursor ("local · 0.6s · 41 tok/s"). Cleared when the
     /// next push-to-talk begins.
     @Published private(set) var lastResponseLatencyDescription: String?
+
+    /// The detected hardware + the advisor's recommendation for this machine
+    /// (drives the resident-model set, keep_alive, and the Phase 5 blue-text
+    /// recommendation). Refreshed at launch.
+    @Published private(set) var hardwareProfile: HardwareProfile = HardwareAdvisor.detect()
+    @Published private(set) var hardwareRecommendation: ModelRecommendation = HardwareAdvisor.recommendForThisMachine()
+    /// Whether the optional `autotune` CLI is installed (hybrid mode). The app is
+    /// fully functional without it; when present it enriches the recommendation.
+    @Published private(set) var autotuneStatus: AutotuneStatus = .notInstalled
 
     /// Whether the local Ollama server is reachable. Drives the panel nudge to
     /// start Ollama if it isn't running.
@@ -67,6 +88,11 @@ final class CompanionManager: ObservableObject {
     /// of the role (see the model picker). Persisted via ModelPreferences.
     @Published private(set) var chatModelName: String = ModelPreferences.chatModel
     @Published private(set) var visionModelName: String = ModelPreferences.visionModel
+    /// The grounding model used for *pointing* turns (the blue cursor's
+    /// coordinates). The default vision model (Moondream) can't ground, so
+    /// pointing routes here. Loaded on demand unless the advisor keeps it
+    /// resident (see warm-up + Phase 4 residency).
+    @Published private(set) var groundingModelName: String = ModelPreferences.groundingModel
 
     /// Every model installed in the user's Ollama, for the model picker, plus the
     /// subset that can accept images — so the vision role can only ever be filled
@@ -81,19 +107,6 @@ final class CompanionManager: ObservableObject {
     /// clipboard action. Set only by the text/vision answer path (not by browser
     /// or app-launch actions), so "copy that" always grabs the actual answer.
     private var lastSpokenAnswer: String?
-
-    // MARK: - Onboarding state (kept for the overlay's first-run experience)
-
-    @Published var onboardingVideoPlayer: AVPlayer?
-    @Published var showOnboardingVideo: Bool = false
-    @Published var onboardingVideoOpacity: Double = 0.0
-
-    @Published var onboardingPromptText: String = ""
-    @Published var onboardingPromptOpacity: Double = 0.0
-    @Published var showOnboardingPrompt: Bool = false
-
-    private var onboardingMusicPlayer: AVAudioPlayer?
-    private var onboardingMusicFadeTimer: Timer?
 
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
@@ -182,24 +195,24 @@ final class CompanionManager: ObservableObject {
         transientHideTask = nil
 
         if enabled {
-            overlayWindowManager.hasShownOverlayBefore = true
-            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-            isOverlayVisible = true
+            presentOverlayAndIntroIfNeeded()
         } else {
             overlayWindowManager.hideOverlay()
             isOverlayVisible = false
         }
     }
 
-    /// Whether the user has completed onboarding at least once.
-    var hasCompletedOnboarding: Bool {
-        get { UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") }
-        set { UserDefaults.standard.set(newValue, forKey: "hasCompletedOnboarding") }
+    /// Whether the first-run intro (blue-text greeting + screen-aware joke) has
+    /// already played. Replaces the old onboarding flag — there is no onboarding
+    /// video or music anymore.
+    var hasSeenIntro: Bool {
+        get { UserDefaults.standard.bool(forKey: "hasSeenIntro") }
+        set { UserDefaults.standard.set(newValue, forKey: "hasSeenIntro") }
     }
 
     func start() {
         refreshAllPermissions()
-        print("🔑 LocalClicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        print("🔑 LocalClicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), introSeen: \(hasSeenIntro)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
@@ -209,15 +222,65 @@ final class CompanionManager: ObservableObject {
         // Pay one-time warm-up costs now, in the background, so the user's first
         // interaction is snappy: the neural voice's inference graph, and both
         // Ollama models loaded and resident (keep_alive keeps them warm).
+        refreshHardwareRecommendation()
+        refreshOllamaInstalled()
         speechSynthesizer.warmUp()
         warmUpLocalModels()
         refreshInstalledModels()
 
-        // If onboarding is done and permissions are granted, show the cursor now.
-        if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
-            overlayWindowManager.hasShownOverlayBefore = true
-            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-            isOverlayVisible = true
+        // Permissions granted → show the cursor now (and, on first launch, play
+        // the intro + screen-aware joke in the blue side-text beside the cursor).
+        if allPermissionsGranted && isClickyCursorEnabled {
+            presentOverlayAndIntroIfNeeded()
+            // A bit later, gently suggest a better-fit model if there is one —
+            // non-invasive blue text, shown at most once per distinct suggestion,
+            // and skipped while the intro/joke is still on screen.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
+                self?.maybeShowModelRecommendation()
+            }
+        }
+    }
+
+    /// True once the recommendation has been shown this launch (don't repeat it).
+    private var hasShownRecommendationThisLaunch = false
+
+    /// Non-invasive autotune-style recommendation: if the advisor's best-fit
+    /// models for this Mac differ from what's currently selected, gently suggest
+    /// the switch in the blue side-text. Shown at most once per distinct
+    /// recommendation (a UserDefaults signature prevents nagging across launches),
+    /// never while other side-text is up, and it auto-dismisses — it can't block
+    /// anything. Credits `autotune` when the CLI is installed.
+    func maybeShowModelRecommendation() {
+        guard isOverlayVisible, companionSideText == nil, !hasShownRecommendationThisLaunch else { return }
+        let rec = hardwareRecommendation
+        let differs = (chatModelName != rec.chatModel) || (visionModelName != rec.visionModel)
+        guard differs else { return }
+
+        let target = chatModelName != rec.chatModel ? rec.chatModel : rec.visionModel
+        let source = autotuneStatus.isInstalled ? "autotune" : "tip"
+        let gb = Int(hardwareProfile.totalRAMGB.rounded())
+        let message = "\(source): \(target) is a great fit for your \(gb) gb mac — switch it in the menu-bar panel under models."
+
+        let signature = "\(rec.chatModel)|\(rec.visionModel)"
+        let key = "localClicky.lastRecommendationShown"
+        guard UserDefaults.standard.string(forKey: key) != signature else { return }
+        UserDefaults.standard.set(signature, forKey: key)
+        hasShownRecommendationThisLaunch = true
+        streamSideText(message, characterInterval: 0.02, holdSeconds: 9, autoDismiss: true)
+    }
+
+    /// Shows the cursor overlay and, the very first time, kicks off the blue-text
+    /// intro + screen-aware joke. Kept in one place so every path that first
+    /// reveals the cursor (launch, cursor toggle, permission grant) plays the
+    /// intro exactly once.
+    private func presentOverlayAndIntroIfNeeded() {
+        overlayWindowManager.hasShownOverlayBefore = true
+        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+        isOverlayVisible = true
+        guard !hasSeenIntro else { return }
+        // Small delay so the cursor has faded in before the intro starts typing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.playFirstRunIntro()
         }
     }
 
@@ -228,19 +291,57 @@ final class CompanionManager: ObservableObject {
     /// roles) so Ollama never reloads a model for a different num_ctx — which also
     /// matters when one model is picked for both roles.
     private func warmUpLocalModels() {
-        // De-dupe in case the same model fills both roles.
-        let models = Array(Set([chatModelName, visionModelName]))
+        // Warm the models the app will actually use, each at the context window
+        // it will be called with (so Ollama never reloads it for a different
+        // num_ctx) and with the advisor's keep_alive so they stay resident. The
+        // grounding model is warmed too only when the advisor says it fits
+        // alongside the others — otherwise it loads on demand for pointing turns.
+        var toWarm: [(model: String, ctx: Int)] = [
+            (chatModelName, contextWindow(forModel: chatModelName)),
+            (visionModelName, contextWindow(forModel: visionModelName)),
+        ]
+        if hardwareRecommendation.keepsGroundingResident {
+            toWarm.append((groundingModelName, contextWindow(forModel: groundingModelName)))
+        }
+        var seen = Set<String>()
+        let unique = toWarm.filter { seen.insert($0.model).inserted }
+        let keepAlive = hardwareRecommendation.keepAlive
         Task.detached(priority: .utility) { [ollamaClient] in
-            for model in models {
+            for entry in unique {
                 _ = try? await ollamaClient.streamChat(
-                    model: model,
+                    model: entry.model,
                     messages: [.user("hi")],
                     temperature: 0.0,
                     maxTokens: 1,
-                    contextWindow: LocalModels.defaultContextWindow,
+                    keepAlive: keepAlive,
+                    contextWindow: entry.ctx,
                     onText: { _ in }
                 )
             }
+        }
+    }
+
+    /// The context window to use for a given model. Vision/grounding models get
+    /// the roomy window (screenshot + history); a pure text model gets a snug one
+    /// (faster prefill, less KV RAM). Checking against the *current* role models
+    /// keeps it reload-safe: a model always gets one consistent value, including
+    /// when a single VLM fills both the text and vision roles.
+    private func contextWindow(forModel model: String) -> Int {
+        if model == visionModelName || model == groundingModelName {
+            return LocalModels.visionContextWindow
+        }
+        return LocalModels.textContextWindow
+    }
+
+    /// Recomputes the hardware profile + recommendation, and (in the background)
+    /// detects the optional autotune CLI. Cheap; safe to call on launch and after
+    /// the user changes models.
+    func refreshHardwareRecommendation() {
+        hardwareProfile = HardwareAdvisor.detect()
+        hardwareRecommendation = HardwareAdvisor.recommend(for: hardwareProfile)
+        Task.detached(priority: .utility) {
+            let status = AutotuneBridge.quickStatus()
+            await MainActor.run { self.autotuneStatus = status }
         }
     }
 
@@ -302,79 +403,212 @@ final class CompanionManager: ObservableObject {
         refreshLocalEngineStatus()
     }
 
+    /// The model to use for a pointing turn: the dedicated grounding model when
+    /// it's installed, otherwise the main vision model (best effort — it may not
+    /// actually ground). Kept in one place so the answer pipeline and any warm-up
+    /// agree on which model pointing uses.
+    private func resolvedGroundingModelName() -> String {
+        guard !installedModels.isEmpty else { return groundingModelName }
+        let names = installedModels.map { $0.name }
+        return OllamaClient.modelInstalled(groundingModelName, among: names) ? groundingModelName : visionModelName
+    }
+
+    // MARK: - Model downloads + Ollama install
+
+    /// Whether Ollama appears installed at all (distinct from "running").
+    @Published private(set) var isOllamaInstalled: Bool = true
+    /// The model currently downloading (nil when idle), its 0…1 progress, and a
+    /// short status line ("downloading", "verifying", "ready").
+    @Published private(set) var downloadingModelName: String?
+    @Published private(set) var downloadFraction: Double = 0
+    @Published private(set) var downloadStatusText: String?
+    /// Ollama install flow state for the panel button.
+    @Published private(set) var ollamaInstallInProgress = false
+    @Published var ollamaInstallMessage: String?
+
+    private var downloadTask: Task<Void, Never>?
+
+    /// Curated models that both FIT this machine (resident footprint ≤ total RAM,
+    /// with margin) and aren't installed yet — exactly what the download dropdown
+    /// should offer. "Only download if it fits."
+    var downloadableModels: [CatalogModel] {
+        let installedNames = installedModels.map { $0.name }
+        return ModelCatalog.all.filter { model in
+            let alreadyInstalled = installedNames.contains { OllamaClient.modelInstalled(model.name, among: [$0]) }
+            let fits = model.residentGB + 1.5 <= hardwareProfile.totalRAMGB
+            return !alreadyInstalled && fits
+        }
+    }
+
+    /// True if `name` is the advisor's recommended model for one of the roles
+    /// (so the download dropdown can mark it).
+    func isRecommendedModel(_ name: String) -> Bool {
+        let rec = hardwareRecommendation
+        return name == rec.chatModel || name == rec.visionModel || name == rec.groundingModel
+    }
+
+    func refreshOllamaInstalled() {
+        isOllamaInstalled = OllamaInstaller.isInstalled()
+    }
+
+    /// One-click: download a model with streamed progress, then refresh the model
+    /// lists and warm it straight into RAM so it's ready to use immediately.
+    func downloadModel(_ name: String) {
+        guard downloadingModelName == nil else { return }
+        downloadingModelName = name
+        downloadFraction = 0
+        downloadStatusText = "starting…"
+        let client = ollamaClient
+        downloadTask = Task { [weak self] in
+            do {
+                for try await progress in client.pullModel(name) {
+                    if Task.isCancelled { break }
+                    await MainActor.run {
+                        self?.downloadFraction = progress.fraction
+                        self?.downloadStatusText = progress.status
+                    }
+                }
+                await MainActor.run {
+                    guard let self else { return }
+                    self.downloadFraction = 1
+                    self.downloadStatusText = "ready"
+                    self.downloadingModelName = nil
+                    self.refreshInstalledModels()
+                    self.refreshLocalEngineStatus()
+                    self.warmUpModel(name)   // resident + ready to use right away
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.downloadStatusText = nil }
+                }
+            } catch {
+                await MainActor.run {
+                    self?.downloadStatusText = "download failed — try again"
+                    self?.downloadFraction = 0
+                    self?.downloadingModelName = nil
+                }
+            }
+        }
+    }
+
+    func cancelDownload() {
+        downloadTask?.cancel()
+        downloadTask = nil
+        downloadingModelName = nil
+        downloadStatusText = nil
+        downloadFraction = 0
+    }
+
+    /// Warms a single model into memory (used right after a download completes).
+    private func warmUpModel(_ name: String) {
+        let ctx = contextWindow(forModel: name)
+        let keepAlive = hardwareRecommendation.keepAlive
+        let client = ollamaClient
+        Task.detached(priority: .utility) {
+            _ = try? await client.streamChat(
+                model: name, messages: [.user("hi")], temperature: 0.0, maxTokens: 1,
+                keepAlive: keepAlive, contextWindow: ctx, onText: { _ in })
+        }
+    }
+
+    /// One-click Ollama setup: if it's installed but not running, launch it; if
+    /// it's not installed, download + install the official app (with a browser
+    /// fallback). Network here is the single user-initiated fetch from ollama.com.
+    func installOrStartOllama() {
+        guard !ollamaInstallInProgress else { return }
+        if OllamaInstaller.isInstalled() {
+            OllamaInstaller.launchInstalledApp()
+            ollamaInstallMessage = "starting ollama…"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.refreshLocalEngineStatus()
+                self?.refreshOllamaInstalled()
+                self?.warmUpLocalModels()
+            }
+            return
+        }
+        ollamaInstallInProgress = true
+        ollamaInstallMessage = "downloading ollama…"
+        Task { [weak self] in
+            let outcome = await OllamaInstaller.install()
+            await MainActor.run {
+                guard let self else { return }
+                self.ollamaInstallInProgress = false
+                switch outcome {
+                case .installedAndLaunched:
+                    self.ollamaInstallMessage = "ollama installed — starting up…"
+                case .openedDownloadPage:
+                    self.ollamaInstallMessage = "opened the ollama download page — drag it to Applications, then reopen."
+                case .failed(let detail):
+                    self.ollamaInstallMessage = "couldn't install ollama: \(detail)"
+                }
+                self.refreshOllamaInstalled()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                    self.refreshLocalEngineStatus()
+                    self.refreshOllamaInstalled()
+                }
+            }
+        }
+    }
+
     /// Restores both roles to LocalClicky's default models.
     func resetModelsToDefaults() {
         ModelPreferences.resetToDefaults()
         chatModelName = ModelPreferences.chatModel
         visionModelName = ModelPreferences.visionModel
+        groundingModelName = ModelPreferences.groundingModel
         warmUpLocalModels()
         refreshLocalEngineStatus()
-    }
-
-    /// Called by BlueCursorView after the buddy finishes its pointing animation.
-    /// Triggers the onboarding sequence.
-    func triggerOnboarding() {
-        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
-        hasCompletedOnboarding = true
-        startOnboardingMusic()
-        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-        isOverlayVisible = true
-    }
-
-    /// Replays the onboarding experience from the panel footer link.
-    func replayOnboarding() {
-        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
-        startOnboardingMusic()
-        overlayWindowManager.hasShownOverlayBefore = false
-        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-        isOverlayVisible = true
-    }
-
-    private func stopOnboardingMusic() {
-        onboardingMusicFadeTimer?.invalidate()
-        onboardingMusicFadeTimer = nil
-        onboardingMusicPlayer?.stop()
-        onboardingMusicPlayer = nil
-    }
-
-    private func startOnboardingMusic() {
-        stopOnboardingMusic()
-        guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else { return }
-        do {
-            let player = try AVAudioPlayer(contentsOf: musicURL)
-            player.volume = 0.3
-            player.play()
-            self.onboardingMusicPlayer = player
-            onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: 90.0, repeats: false) { [weak self] _ in
-                self?.fadeOutOnboardingMusic()
-            }
-        } catch {
-            print("⚠️ LocalClicky: failed to play onboarding music: \(error)")
-        }
-    }
-
-    private func fadeOutOnboardingMusic() {
-        guard let player = onboardingMusicPlayer else { return }
-        let fadeSteps = 30
-        let stepInterval = 3.0 / Double(fadeSteps)
-        let volumeDecrement = player.volume / Float(fadeSteps)
-        var stepsRemaining = fadeSteps
-        onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { [weak self] timer in
-            stepsRemaining -= 1
-            player.volume -= volumeDecrement
-            if stepsRemaining <= 0 {
-                timer.invalidate()
-                player.stop()
-                self?.onboardingMusicPlayer = nil
-                self?.onboardingMusicFadeTimer = nil
-            }
-        }
     }
 
     func clearDetectedElementLocation() {
         detectedElementScreenLocation = nil
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
+    }
+
+    // MARK: - Blue side-text channel
+
+    /// Fades out and clears any blue side-text shown beside the cursor.
+    func dismissSideText() {
+        sideTextStreamTask?.cancel()
+        sideTextStreamTask = nil
+        guard companionSideText != nil else { return }
+        withAnimation(.easeOut(duration: 0.25)) { companionSideTextOpacity = 0.0 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, self.companionSideTextOpacity == 0.0 else { return }
+            self.companionSideText = nil
+        }
+    }
+
+    /// Types `message` into the blue side-text bubble one character at a time
+    /// (the signature streamed-text feel), holds it, then fades out — unless
+    /// `autoDismiss` is false, in which case it stays until something replaces it.
+    /// `onFinished` runs after the full message is on screen (used to chain the
+    /// first-run intro into the screen-aware joke).
+    func streamSideText(_ message: String,
+                        characterInterval: TimeInterval = 0.03,
+                        holdSeconds: TimeInterval = 6.0,
+                        autoDismiss: Bool = true,
+                        onFinished: (@MainActor () -> Void)? = nil) {
+        sideTextStreamTask?.cancel()
+        let characters = Array(message)
+        companionSideText = ""
+        companionSideTextOpacity = 0.0
+        withAnimation(.easeIn(duration: 0.35)) { companionSideTextOpacity = 1.0 }
+
+        sideTextStreamTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var shown = ""
+            for character in characters {
+                if Task.isCancelled { return }
+                shown.append(character)
+                self.companionSideText = shown
+                try? await Task.sleep(nanoseconds: UInt64(characterInterval * 1_000_000_000))
+            }
+            if Task.isCancelled { return }
+            onFinished?()
+            guard autoDismiss else { return }
+            try? await Task.sleep(nanoseconds: UInt64(holdSeconds * 1_000_000_000))
+            if Task.isCancelled { return }
+            self.dismissSideText()
+        }
     }
 
     func stop() {
@@ -389,7 +623,6 @@ final class CompanionManager: ObservableObject {
         audioPowerCancellable?.cancel()
         accessibilityCheckTimer?.invalidate()
         accessibilityCheckTimer = nil
-        stopOnboardingMusic()
     }
 
     func refreshAllPermissions() {
@@ -447,11 +680,9 @@ final class CompanionManager: ObservableObject {
                 self.hasScreenContentPermission = true
                 UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
                 print("✅ Screen content auto-confirmed (Screen Recording is granted).")
-                if self.hasCompletedOnboarding && self.allPermissionsGranted
+                if self.allPermissionsGranted
                     && !self.isOverlayVisible && self.isClickyCursorEnabled {
-                    self.overlayWindowManager.hasShownOverlayBefore = true
-                    self.overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-                    self.isOverlayVisible = true
+                    self.presentOverlayAndIntroIfNeeded()
                 }
             }
         }
@@ -481,10 +712,8 @@ final class CompanionManager: ObservableObject {
                     guard didCapture else { return }
                     hasScreenContentPermission = true
                     UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
-                    if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
-                        overlayWindowManager.hasShownOverlayBefore = true
-                        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-                        isOverlayVisible = true
+                    if allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
+                        presentOverlayAndIntroIfNeeded()
                     }
                 }
             } catch {
@@ -544,7 +773,6 @@ final class CompanionManager: ObservableObject {
         switch transition {
         case .pressed:
             guard !buddyDictationManager.isDictationInProgress else { return }
-            guard !showOnboardingVideo else { return }
 
             transientHideTask?.cancel()
             transientHideTask = nil
@@ -562,15 +790,8 @@ final class CompanionManager: ObservableObject {
             currentResponseIdentifier = nil
             speechSynthesizer.stopPlayback()
             clearDetectedElementLocation()
+            dismissSideText()
             lastResponseLatencyDescription = nil
-
-            if showOnboardingPrompt {
-                withAnimation(.easeOut(duration: 0.3)) { onboardingPromptOpacity = 0.0 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    self.showOnboardingPrompt = false
-                    self.onboardingPromptText = ""
-                }
-            }
 
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = Task {
@@ -649,8 +870,19 @@ final class CompanionManager: ObservableObject {
                     settleAfterAction()
                     return
                 }
+                if route == .showText {
+                    await handleShowTextCommand(transcript: transcript)
+                    settleAfterAction()
+                    return
+                }
+                if route == .webReach {
+                    await handleWebReachCommand(transcript: transcript)
+                    settleAfterAction()
+                    return
+                }
 
-                let useScreen = (route == .screen)
+                let useScreen = (route == .screen || route == .screenPoint)
+                let wantsPointing = (route == .screenPoint)
 
                 var cursorScreenCapture: CompanionScreenCapture?
                 let systemPrompt: String
@@ -660,11 +892,30 @@ final class CompanionManager: ObservableObject {
                 if useScreen, let capture = try? await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG() {
                     cursorScreenCapture = capture
                     userImagesBase64 = [capture.imageData.base64EncodedString()]
-                    systemPrompt = LocalPrompts.screenVoiceResponse(
-                        imageWidthInPixels: capture.screenshotWidthInPixels,
-                        imageHeightInPixels: capture.screenshotHeightInPixels
-                    )
-                    model = visionModelName
+                    if wantsPointing {
+                        // Pointing turn: use the grounding model + the pointing
+                        // prompt. If the resolved model can't ground (grounding
+                        // model not installed and the vision model is Moondream),
+                        // describe instead of asking it for empty coordinates.
+                        let pointingModel = resolvedGroundingModelName()
+                        if LocalModels.isLikelyGroundingCapable(pointingModel) {
+                            systemPrompt = LocalPrompts.screenPointResponse(
+                                imageWidthInPixels: capture.screenshotWidthInPixels,
+                                imageHeightInPixels: capture.screenshotHeightInPixels)
+                        } else {
+                            systemPrompt = LocalPrompts.screenDescribe(
+                                imageWidthInPixels: capture.screenshotWidthInPixels,
+                                imageHeightInPixels: capture.screenshotHeightInPixels)
+                        }
+                        model = pointingModel
+                    } else {
+                        // Describe/answer turn: the default vision model (Moondream),
+                        // which is strong at description but doesn't emit coordinates.
+                        systemPrompt = LocalPrompts.screenDescribe(
+                            imageWidthInPixels: capture.screenshotWidthInPixels,
+                            imageHeightInPixels: capture.screenshotHeightInPixels)
+                        model = visionModelName
+                    }
                 } else {
                     systemPrompt = LocalPrompts.textVoiceResponse
                     model = chatModelName
@@ -703,7 +954,8 @@ final class CompanionManager: ObservableObject {
                     messages: messages,
                     temperature: cursorScreenCapture == nil ? 0.7 : 0.3,
                     maxTokens: cursorScreenCapture == nil ? 220 : 180,
-                    contextWindow: LocalModels.defaultContextWindow,
+                    keepAlive: hardwareRecommendation.keepAlive,
+                    contextWindow: contextWindow(forModel: model),
                     onText: { accumulated in
                         let speakable = SpokenTextSegmenter.speakablePrefix(accumulated)
                         if let (sentence, _) = speechProgress.advance(speakable: speakable) {
@@ -871,6 +1123,177 @@ final class CompanionManager: ObservableObject {
         catch { print("⚠️ TTS error during clipboard command: \(error)") }
     }
 
+    /// Answers a "give me X in text" command: a concise, honest answer rendered
+    /// in the blue side-text beside the cursor (and spoken). Uses the fast text
+    /// model; the conciseText prompt forces brevity and forbids made-up facts.
+    private func handleShowTextCommand(transcript: String) async {
+        voiceState = .processing
+        var answer = ""
+        do {
+            let result = try await ollamaClient.streamChat(
+                model: chatModelName,
+                messages: [.system(LocalPrompts.conciseText), .user(transcript)],
+                temperature: 0.2,
+                maxTokens: 64,
+                keepAlive: hardwareRecommendation.keepAlive,
+                contextWindow: contextWindow(forModel: chatModelName),
+                onText: { _ in })
+            answer = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch is CancellationError {
+            return
+        } catch {
+            print("⚠️ give-text error: \(error)")
+            refreshLocalEngineStatus()
+        }
+
+        conversationHistory.append((userTranscript: transcript, assistantResponse: answer))
+        if conversationHistory.count > 10 { conversationHistory.removeFirst(conversationHistory.count - 10) }
+        previousTurnUsedScreen = false
+
+        guard !answer.isEmpty else {
+            streamSideText("hmm, i couldn't get that one. try asking again.", holdSeconds: 5, autoDismiss: true)
+            return
+        }
+        lastSpokenAnswer = answer
+        // Blue text is the primary output for this command; also speak it since
+        // LocalClicky is voice-first.
+        streamSideText(answer, characterInterval: 0.02, holdSeconds: 10, autoDismiss: true)
+        voiceState = .responding
+        do { try await speechSynthesizer.speakText(answer) }
+        catch { print("⚠️ TTS error during give-text: \(error)") }
+    }
+
+    // MARK: - Web reach (the one opt-in internet feature)
+
+    /// Answers an internet-needing question: fetches web results via WebReachTool
+    /// (Jina Reader — the one documented cloud call), then has the local text
+    /// model synthesize a spoken answer grounded only in what was fetched. Shows
+    /// "checking the web…" in the blue text first, since this is the single
+    /// feature that leaves the no-cloud guarantee.
+    private func handleWebReachCommand(transcript: String) async {
+        voiceState = .processing
+        streamSideText("checking the web…", autoDismiss: false)
+
+        let results = await WebReachTool.search(transcript)
+        guard !Task.isCancelled else { dismissSideText(); return }
+
+        guard let results, !results.isEmpty else {
+            dismissSideText()
+            previousTurnUsedScreen = false
+            let message = "i couldn't reach the web just now — check your connection and try again."
+            voiceState = .responding
+            do { try await speechSynthesizer.speakText(message) }
+            catch { print("⚠️ TTS error during web-reach: \(error)") }
+            return
+        }
+
+        var answer = ""
+        do {
+            let synthesis = try await ollamaClient.streamChat(
+                model: chatModelName,
+                messages: [.system(LocalPrompts.webAnswer),
+                           .user("question: \(transcript)\n\nweb results:\n\(results)")],
+                temperature: 0.3,
+                maxTokens: 180,
+                keepAlive: hardwareRecommendation.keepAlive,
+                contextWindow: contextWindow(forModel: chatModelName),
+                onText: { _ in })
+            answer = synthesis.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch is CancellationError {
+            dismissSideText(); return
+        } catch {
+            print("⚠️ web-reach synthesis error: \(error)")
+            refreshLocalEngineStatus()
+        }
+
+        dismissSideText()
+        conversationHistory.append((userTranscript: transcript, assistantResponse: answer))
+        if conversationHistory.count > 10 { conversationHistory.removeFirst(conversationHistory.count - 10) }
+        previousTurnUsedScreen = false
+
+        guard !answer.isEmpty else {
+            let message = "i found some pages but couldn't pull an answer out of them."
+            voiceState = .responding
+            do { try await speechSynthesizer.speakText(message) }
+            catch { print("⚠️ TTS error during web-reach: \(error)") }
+            return
+        }
+        lastSpokenAnswer = answer
+        voiceState = .responding
+        do { try await speechSynthesizer.speakText(answer) }
+        catch { print("⚠️ TTS error during web-reach: \(error)") }
+    }
+
+    // MARK: - First-run intro (blue side-text) + screen-aware joke
+
+    /// First launch only: streams a short self-intro in the blue side-text while,
+    /// in parallel, grabbing the screen; when the intro finishes, drops a
+    /// screen-aware joke into the same blue text (and speaks it).
+    func playFirstRunIntro() {
+        // Capture + joke generation start immediately, in parallel with the intro
+        // streaming — so the joke is usually ready by the time the intro ends.
+        let jokeTask = Task<String?, Never> { [weak self] in
+            guard let self else { return nil }
+            return await self.generateScreenJoke()
+        }
+
+        let intro = "hey, i'm localclicky — your on-device mac buddy. hold control and option to talk to me, and i'll answer out loud and fly my blue cursor to things on your screen. everything runs locally on your mac, no cloud. one sec, let me see what you're up to…"
+        streamSideText(intro, characterInterval: 0.026, autoDismiss: false) { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                let joke = await jokeTask.value
+                // If the user already started talking (side text cleared), don't barge in.
+                guard self.companionSideText != nil else { return }
+                if let joke, !joke.isEmpty {
+                    self.streamSideText(joke, characterInterval: 0.03, holdSeconds: 9, autoDismiss: true)
+                    self.voiceState = .responding
+                    do { try await self.speechSynthesizer.speakText(joke) }
+                    catch { /* a missing voice shouldn't break the intro */ }
+                    self.voiceState = .idle
+                } else {
+                    self.dismissSideText()
+                }
+            }
+        }
+    }
+
+    /// Captures the screen and produces a one-line, screen-aware joke via a
+    /// two-step pipeline: the vision model glances (a simple describe it can
+    /// actually do), then the wittier text model turns that into the joke.
+    /// Returns nil if the screen isn't available or both steps fail.
+    private func generateScreenJoke() async -> String? {
+        guard hasScreenContentPermission else { return nil }
+        guard let capture = try? await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG() else { return nil }
+
+        // Step 1 — vision model glance (simple imperative; reliable on Moondream).
+        let glance = try? await ollamaClient.streamChat(
+            model: visionModelName,
+            messages: [.system(LocalPrompts.screenGlanceSystem),
+                       .user(LocalPrompts.screenGlanceUser,
+                             imagesBase64: [capture.imageData.base64EncodedString()])],
+            temperature: 0.3,
+            maxTokens: 60,
+            keepAlive: hardwareRecommendation.keepAlive,
+            contextWindow: contextWindow(forModel: visionModelName),
+            onText: { _ in })
+        var description = glance?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The small vision model occasionally returns empty/garbage; fall back to
+        // a generic-but-still-screen-aware description so the joke still lands.
+        if description.count < 8 { description = "their computer screen with a few things open" }
+
+        // Step 2 — text model turns the description into a witty one-liner.
+        let joke = try? await ollamaClient.streamChat(
+            model: chatModelName,
+            messages: [.system(LocalPrompts.screenJokeFromDescription),
+                       .user("the user is looking at: \(description). make the joke.")],
+            temperature: 0.9,
+            maxTokens: 50,
+            keepAlive: hardwareRecommendation.keepAlive,
+            contextWindow: contextWindow(forModel: chatModelName),
+            onText: { _ in })
+        return joke?.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Converts a point in the screenshot's pixel space (top-left origin) to a
     /// global AppKit screen coordinate (bottom-left origin) on the captured
     /// display. This is the same mapping the original used for cloud coords.
@@ -934,93 +1357,4 @@ final class CompanionManager: ObservableObject {
         Task { try? await speechSynthesizer.speakText(utterance) }
     }
 
-    // MARK: - Onboarding (fully local)
-
-    /// LocalClicky has no cloud onboarding video. Instead, on first run the
-    /// overlay does a short local demo: the cursor points at something on screen
-    /// (via the local vision model), then the intro prompt streams in.
-    func setupOnboardingVideo() {
-        showOnboardingVideo = false
-        onboardingVideoOpacity = 0.0
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.performOnboardingDemoInteraction()
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 7.0) { [weak self] in
-            self?.startOnboardingPromptStream()
-        }
-    }
-
-    func tearDownOnboardingVideo() {
-        showOnboardingVideo = false
-        onboardingVideoPlayer = nil
-    }
-
-    private func startOnboardingPromptStream() {
-        let message = "press control + option and introduce yourself"
-        onboardingPromptText = ""
-        showOnboardingPrompt = true
-        onboardingPromptOpacity = 0.0
-        withAnimation(.easeIn(duration: 0.4)) { onboardingPromptOpacity = 1.0 }
-
-        var currentIndex = 0
-        Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { timer in
-            guard currentIndex < message.count else {
-                timer.invalidate()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) {
-                    guard self.showOnboardingPrompt else { return }
-                    withAnimation(.easeOut(duration: 0.3)) { self.onboardingPromptOpacity = 0.0 }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                        self.showOnboardingPrompt = false
-                        self.onboardingPromptText = ""
-                    }
-                }
-                return
-            }
-            let index = message.index(message.startIndex, offsetBy: currentIndex)
-            self.onboardingPromptText.append(message[index])
-            currentIndex += 1
-        }
-    }
-
-    /// Captures a screenshot and asks the local vision model to find something
-    /// fun to point at, then flies the buddy there. Local replacement for the
-    /// cloud onboarding demo.
-    func performOnboardingDemoInteraction() {
-        guard voiceState == .idle || voiceState == .responding else { return }
-        guard hasScreenContentPermission else { return }
-
-        Task {
-            do {
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-                guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else { return }
-
-                let systemPrompt = LocalPrompts.onboardingDemo(
-                    imageWidthInPixels: cursorScreenCapture.screenshotWidthInPixels,
-                    imageHeightInPixels: cursorScreenCapture.screenshotHeightInPixels
-                )
-                let result = try await ollamaClient.streamChat(
-                    model: visionModelName,
-                    messages: [
-                        .system(systemPrompt),
-                        .user("look around my screen and find something interesting to point at",
-                              imagesBase64: [cursorScreenCapture.imageData.base64EncodedString()]),
-                    ],
-                    temperature: 0.4,
-                    maxTokens: 120,
-                    contextWindow: LocalModels.defaultContextWindow,
-                    onText: { _ in }
-                )
-
-                let pointing = PointingTagParser.parse(from: result.text)
-                guard let center = pointing.centerInImagePixels else { return }
-
-                detectedElementBubbleText = pointing.spokenText
-                detectedElementScreenLocation = globalScreenLocation(forImagePoint: center, in: cursorScreenCapture)
-                detectedElementDisplayFrame = cursorScreenCapture.displayFrame
-                print("🎯 Onboarding demo: pointing at \"\(pointing.label ?? "element")\" — \"\(pointing.spokenText)\"")
-            } catch {
-                print("⚠️ Onboarding demo error: \(error)")
-            }
-        }
-    }
 }

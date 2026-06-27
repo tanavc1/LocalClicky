@@ -199,6 +199,212 @@ func runBenchmark(imagePath: String?, iterations: Int) async {
     }
 }
 
+// MARK: - Benchmark suite (structured, reproducible before/after)
+
+/// One model's measured numbers, JSON-encoded into the report so before/after
+/// runs can be diffed mechanically rather than eyeballed.
+struct BenchRunResult: Codable {
+    let model: String
+    let role: String                 // "text" | "vision"
+    let samples: Int                 // prompt runs that succeeded
+    let meanFirstTokenSeconds: Double
+    let meanTotalSeconds: Double
+    let meanTokensPerSecond: Double
+    let pointParseRate: Double       // fraction that returned a [POINT] tag (vision)
+    let pointInBoundsRate: Double    // fraction whose coords landed inside the image (vision)
+}
+
+/// The full report written to docs/benchmarks/. Captures enough provenance
+/// (commit, image, hardware snapshot) that a run is meaningful months later.
+struct BenchSuiteReport: Codable {
+    let label: String                // "baseline" | "after" | custom
+    let timestamp: String
+    let gitCommit: String
+    let image: String
+    let imageWidth: Int
+    let imageHeight: Int
+    let iterations: Int
+    let textModel: String
+    let visionModel: String
+    let ollamaPs: String
+    let results: [BenchRunResult]
+}
+
+/// Shells out to a command and returns its trimmed stdout (best-effort, "" on failure).
+/// Used for `ollama ps` (resident-model RAM snapshot) and the git commit stamp.
+func shellCapture(_ command: String, _ arguments: [String]) -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = [command] + arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+    do { try process.run() } catch { return "" }
+    process.waitUntilExit()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    return (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Benchmarks the text model on a few representative prompts (latency only).
+func benchTextModel(_ client: OllamaClient, model: String, prompts: [String], iterations: Int) async -> BenchRunResult {
+    var samples = LatencySamples()
+    // Discard one warm-up so steady-state numbers aren't polluted by model load.
+    // Uses the app's per-role text context window (the autotune KV right-sizing).
+    _ = try? await client.streamChat(model: model, messages: [.system(LocalPrompts.textVoiceResponse), .user("hi")],
+                                     temperature: 0.2, maxTokens: 8,
+                                     contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    for prompt in prompts {
+        for _ in 0..<iterations {
+            if let result = try? await client.streamChat(
+                model: model,
+                messages: [.system(LocalPrompts.textVoiceResponse), .user(prompt)],
+                temperature: 0.2, maxTokens: 100,
+                contextWindow: LocalModels.textContextWindow, onText: { _ in }) {
+                samples.record(result)
+            }
+        }
+    }
+    return BenchRunResult(model: model, role: "text", samples: samples.total.count,
+                          meanFirstTokenSeconds: samples.meanFirstToken,
+                          meanTotalSeconds: samples.meanTotal,
+                          meanTokensPerSecond: samples.meanTokensPerSecond,
+                          pointParseRate: 0, pointInBoundsRate: 0)
+}
+
+/// Benchmarks one vision model on UI-grounding prompts. Beyond latency, it
+/// measures how often the model returns a *parseable* [POINT] tag and how often
+/// those coordinates land inside the image — an honest, reproducible proxy for
+/// "can the blue cursor actually rely on this model to point" (true target
+/// accuracy would need hand-labeled ground truth, which this does not claim).
+func benchVisionModel(_ client: OllamaClient, model: String, imageBase64: String,
+                      width: Int, height: Int, prompts: [String], iterations: Int) async -> BenchRunResult {
+    // The dedicated directive pointing prompt (forces a well-formed tag), at the
+    // app's per-role vision context window.
+    let systemPrompt = LocalPrompts.screenPointResponse(imageWidthInPixels: width, imageHeightInPixels: height)
+    var samples = LatencySamples()
+    var parsed = 0, inBounds = 0, attempts = 0
+    // Warm-up (discarded).
+    _ = try? await client.streamChat(model: model,
+        messages: [.system(systemPrompt), .user(prompts.first ?? "what's on screen?", imagesBase64: [imageBase64])],
+        temperature: 0.2, maxTokens: 160, contextWindow: LocalModels.visionContextWindow, onText: { _ in })
+    for prompt in prompts {
+        for _ in 0..<iterations {
+            attempts += 1
+            guard let result = try? await client.streamChat(
+                model: model,
+                messages: [.system(systemPrompt), .user(prompt, imagesBase64: [imageBase64])],
+                temperature: 0.2, maxTokens: 160, contextWindow: LocalModels.visionContextWindow, onText: { _ in }) else { continue }
+            samples.record(result)
+            let pointing = PointingTagParser.parse(from: result.text)
+            if pointing.hasPoint, let center = pointing.centerInImagePixels {
+                parsed += 1
+                if center.x >= 0, center.x <= CGFloat(width), center.y >= 0, center.y <= CGFloat(height) {
+                    inBounds += 1
+                }
+            }
+        }
+    }
+    let denom = Double(max(attempts, 1))
+    return BenchRunResult(model: model, role: "vision", samples: samples.total.count,
+                          meanFirstTokenSeconds: samples.meanFirstToken,
+                          meanTotalSeconds: samples.meanTotal,
+                          meanTokensPerSecond: samples.meanTokensPerSecond,
+                          pointParseRate: Double(parsed) / denom,
+                          pointInBoundsRate: Double(inBounds) / denom)
+}
+
+/// Structured before/after benchmark. Measures the text model plus every
+/// installed vision candidate (so qwen2.5vl and moondream can be compared
+/// head-to-head), then writes a JSON + Markdown report under docs/benchmarks/.
+///   localbrain-harness --benchmark-suite <image.png> [iterations] [label]
+func runBenchmarkSuite(imagePath: String, iterations: Int, label: String) async {
+    let client = OllamaClient()
+    print("=== LocalClicky benchmark suite — \(label) (\(iterations)x each prompt) ===")
+    guard await client.isServerReachable() else {
+        print("❌ Ollama not reachable on \(client.baseURL). Start it: ollama serve"); exit(1)
+    }
+    guard let rawData = FileManager.default.contents(atPath: imagePath) else {
+        print("❌ couldn't read image at \(imagePath)"); exit(1)
+    }
+    // Prefer the PNG header; fall back to a JPEG decode for size.
+    var (width, height) = pngPixelSize(path: imagePath) ?? (0, 0)
+    if width == 0 || height == 0 {
+        if let resized = resizedJPEG(from: rawData, longEdge: 4096, compression: 1.0) { (width, height) = (resized.width, resized.height) }
+    }
+    let imageBase64 = rawData.base64EncodedString()
+
+    let textPrompts = [
+        "what's 12 times 8? answer in one short sentence.",
+        "explain what git is, in two short sentences.",
+        "what's the capital of france?",
+    ]
+    let pointPrompts = [
+        "where do i click to open settings?",
+        "point at the search bar.",
+        "where is the close button?",
+        "show me where to type.",
+    ]
+
+    var results: [BenchRunResult] = []
+
+    print("\n--- text model: \(LocalModels.chatModel) ---")
+    let textResult = await benchTextModel(client, model: LocalModels.chatModel, prompts: textPrompts, iterations: iterations)
+    results.append(textResult)
+    print(String(format: "  TTFT %.2fs | total %.2fs | %.0f tok/s",
+                 textResult.meanFirstTokenSeconds, textResult.meanTotalSeconds, textResult.meanTokensPerSecond))
+
+    // Every installed vision candidate, so the swap can be judged on real numbers.
+    let installed = (try? await client.listInstalledModels())?.map { $0.name } ?? []
+    var visionCandidates: [String] = []
+    for candidate in ["qwen2.5vl:3b", "moondream", "qwen3-vl:8b"] where OllamaClient.modelInstalled(candidate, among: installed) {
+        // Normalize moondream → the actual installed tag so the request matches.
+        let resolved = installed.first { OllamaClient.modelInstalled(candidate, among: [$0]) } ?? candidate
+        if !visionCandidates.contains(resolved) { visionCandidates.append(resolved) }
+    }
+    for model in visionCandidates {
+        print("\n--- vision model: \(model) [\(width)x\(height)] ---")
+        let result = await benchVisionModel(client, model: model, imageBase64: imageBase64,
+                                            width: width, height: height, prompts: pointPrompts, iterations: iterations)
+        results.append(result)
+        print(String(format: "  TTFT %.2fs | total %.2fs | %.0f tok/s | point-parse %.0f%% | in-bounds %.0f%%",
+                     result.meanFirstTokenSeconds, result.meanTotalSeconds, result.meanTokensPerSecond,
+                     result.pointParseRate * 100, result.pointInBoundsRate * 100))
+    }
+
+    // Provenance + write the report.
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let report = BenchSuiteReport(
+        label: label, timestamp: stamp,
+        gitCommit: shellCapture("git", ["rev-parse", "--short", "HEAD"]),
+        image: imagePath, imageWidth: width, imageHeight: height, iterations: iterations,
+        textModel: LocalModels.chatModel, visionModel: LocalModels.visionModel,
+        ollamaPs: shellCapture("ollama", ["ps"]), results: results)
+
+    let dateOnly = String(stamp.prefix(10))
+    let outDir = "docs/benchmarks"
+    try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+    let jsonPath = "\(outDir)/\(label)-\(dateOnly).json"
+    let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    if let data = try? encoder.encode(report) { try? data.write(to: URL(fileURLWithPath: jsonPath)) }
+
+    // Human-readable Markdown alongside the JSON.
+    var md = "# LocalClicky benchmark — \(label)\n\n"
+    md += "- Date: \(stamp)\n- Commit: \(report.gitCommit)\n- Image: \(imagePath) (\(width)x\(height))\n- Iterations per prompt: \(iterations)\n\n"
+    md += "| Model | Role | TTFT (s) | Total (s) | tok/s | Point-parse | In-bounds |\n"
+    md += "|---|---|---:|---:|---:|---:|---:|\n"
+    for r in results {
+        let pp = r.role == "vision" ? String(format: "%.0f%%", r.pointParseRate * 100) : "—"
+        let ib = r.role == "vision" ? String(format: "%.0f%%", r.pointInBoundsRate * 100) : "—"
+        md += String(format: "| %@ | %@ | %.2f | %.2f | %.0f | %@ | %@ |\n",
+                     r.model, r.role, r.meanFirstTokenSeconds, r.meanTotalSeconds, r.meanTokensPerSecond, pp, ib)
+    }
+    md += "\n```\nollama ps:\n\(report.ollamaPs)\n```\n"
+    let mdPath = "\(outDir)/\(label)-\(dateOnly).md"
+    try? md.write(toFile: mdPath, atomically: true, encoding: .utf8)
+
+    print("\n📊 wrote \(jsonPath)\n📊 wrote \(mdPath)")
+}
+
 /// Dependency-free assertion runner so the pointing-tag parser can be verified
 /// on a Command-Line-Tools-only machine (XCTest needs full Xcode).
 func runSelfTest() -> Never {
@@ -233,6 +439,15 @@ func runSelfTest() -> Never {
     check("multiple tags: last wins, all stripped", t7.centerInImagePixels == CGPoint(x: 30, y: 40)
           && !t7.spokenText.contains("POINT"))
 
+    // qwen2.5-vl's actual attribute output format.
+    let t8 = PointingTagParser.parse(from: "the gear icon, top right. [POINT x=\"736\" y=\"45\"]")
+    check("attribute [POINT x=.. y=..] form", t8.centerInImagePixels == CGPoint(x: 736, y: 45)
+          && t8.spokenText == "the gear icon, top right.")
+    let t9 = PointingTagParser.parse(from: "here it is [POINT x1=\"10\" y1=\"20\" x2=\"30\" y2=\"40\" label=\"save\"]")
+    check("attribute box form → center + label", t9.centerInImagePixels == CGPoint(x: 20, y: 30) && t9.label == "save")
+    let t10 = PointingTagParser.parse(from: "no good target here [POINT:none]")
+    check("attribute parser still honors none", !t10.hasPoint)
+
     // --- ConversationRouter ---
     // Default daily context: vision mode on, screen available.
     func ctx(prevScreen: Bool = false, history: Bool = false,
@@ -246,9 +461,20 @@ func runSelfTest() -> Never {
     check("math → text", route("what's 3 times 5", ctx()) == .text)
     check("math follow-up → text", route("add 2 to that", ctx(prevScreen: false, history: true)) == .text)
     check("general knowledge → text", route("what's the capital of france", ctx()) == .text)
-    check("screen 'where do i click' → screen", route("where do i click to start recording", ctx()) == .screen)
-    check("screen 'this button' → screen", route("what does this button do", ctx()) == .screen)
+    // Pointing intent → screenPoint (grounding model); describing → screen (Moondream).
+    check("'where do i click' → screenPoint", route("where do i click to start recording", ctx()) == .screenPoint)
+    check("'point at the search bar' → screenPoint", route("point at the search bar", ctx()) == .screenPoint)
+    check("'which button do i press' → screenPoint", route("which button do i press to save", ctx()) == .screenPoint)
+    check("'show me where to type' → screenPoint", route("show me where to type my password", ctx()) == .screenPoint)
+    // A pointing question that mentions "open settings" must point, not launch the app.
+    check("'where do i click to open settings' → screenPoint (not openApp)",
+          route("where do i click to open settings", ctx()) == .screenPoint)
+    check("'point at the gmail tab' → screenPoint (not browser)",
+          route("point at the gmail tab", ctx()) == .screenPoint)
+    check("plain 'open settings' still → openApp", route("open the settings app", ctx()) == .openApp)
+    check("screen 'this button' → screen (describe)", route("what does this button do", ctx()) == .screen)
     check("screen 'explain this error' → screen", route("explain this error", ctx()) == .screen)
+    check("screen 'what's on my screen' → screen", route("what's on my screen right now", ctx()) == .screen)
     check("browser new tab → browserCommand", route("open a new tab and go to gmail", ctx()) == .browserCommand)
     check("browser gmail draft → browserCommand", route("go to my gmail and open up a draft", ctx()) == .browserCommand)
     check("browser works in text mode", route("open youtube", ctx(vision: false)) == .browserCommand)
@@ -330,6 +556,38 @@ func runSelfTest() -> Never {
           route("copy what you just said", ctx()) == .copyLastAnswer)
     check("plain 'copy this file' is NOT clipboard route",
           route("how do i copy this file", ctx()) != .copyLastAnswer)
+
+    // --- "give text" (blue side-text answers) ---
+    check("'give me X in text' → showText",
+          route("give me martin luther king's birthday in text", ctx()) == .showText)
+    check("'give text' → showText", route("give text", ctx()) == .showText)
+    check("'show me the text' → showText", route("show me the text for that", ctx()) == .showText)
+    check("'give me pi in text' works in text mode too",
+          route("give me pi in text", ctx(vision: false)) == .showText)
+    check("plain question is NOT showText", route("what's the capital of france", ctx()) == .text)
+
+    // --- Web reach (the one internet-answering route) ---
+    check("'what's the latest … online' → webReach",
+          route("what's the latest on the mars mission online", ctx()) == .webReach)
+    check("'look it up online' → webReach", route("look it up online for me", ctx()) == .webReach)
+    check("'search the web and tell me' → webReach",
+          route("search the web and tell me who won", ctx()) == .webReach)
+    check("plain local question is NOT webReach", route("what's the capital of france", ctx()) == .text)
+    check("'open gmail' still → browserCommand (not webReach)", route("open gmail", ctx()) == .browserCommand)
+    check("webReach search URL targets r.jina.ai", WebReachTool.searchURL(for: "nobel prize")?.host == "r.jina.ai")
+    check("webReach read URL targets r.jina.ai", WebReachTool.readURL(for: "example.com")?.host == "r.jina.ai")
+
+    // --- Prompt integrity (describe vs point vs honest concise) ---
+    check("conciseText forbids made-up facts", LocalPrompts.conciseText.contains("never make up"))
+    check("screenDescribe has NO pointing instruction",
+          !LocalPrompts.screenDescribe(imageWidthInPixels: 100, imageHeightInPixels: 100).contains("[POINT"))
+    check("screenVoiceResponse keeps pointing instruction",
+          LocalPrompts.screenVoiceResponse(imageWidthInPixels: 100, imageHeightInPixels: 100).contains("[POINT"))
+    check("screenPointResponse demands a tag every time",
+          LocalPrompts.screenPointResponse(imageWidthInPixels: 100, imageHeightInPixels: 100).contains("[POINT:x,y:label]")
+          && LocalPrompts.screenPointResponse(imageWidthInPixels: 100, imageHeightInPixels: 100).lowercased().contains("must always"))
+    check("isLikelyGroundingCapable: moondream is not", !LocalModels.isLikelyGroundingCapable("moondream"))
+    check("isLikelyGroundingCapable: qwen2.5vl is", LocalModels.isLikelyGroundingCapable("qwen2.5vl:3b"))
     check("'open gmail' still → browserCommand", route("open gmail", ctx()) == .browserCommand)
     check("'open a new tab and go to gmail' still → browserCommand",
           route("open a new tab and go to gmail", ctx()) == .browserCommand)
@@ -366,7 +624,52 @@ func runSelfTest() -> Never {
     check("missing model not matched",
           !OllamaClient.modelInstalled("mistral:7b", among: ["llama3.2:3b"]))
 
-    print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER + AGENT TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
+    // --- HardwareAdvisor (recommendation is a pure function of the profile) ---
+    func profile(total: Double, avail: Double) -> HardwareProfile {
+        HardwareProfile(totalRAMGB: total, availableRAMGB: avail, physicalCores: 8, isAppleSilicon: true)
+    }
+    let rec16 = HardwareAdvisor.recommend(for: profile(total: 16, avail: 6.3))
+    check("16GB → llama3.2:3b text", rec16.chatModel == "llama3.2:3b")
+    check("16GB → moondream vision", rec16.visionModel == "moondream")
+    check("16GB → qwen2.5vl grounding", rec16.groundingModel == "qwen2.5vl:3b")
+    check("16GB keeps text+vision resident",
+          rec16.residentModels.contains("llama3.2:3b") && rec16.residentModels.contains("moondream"))
+    check("16GB does NOT keep grounding resident (tight)", !rec16.keepsGroundingResident)
+    let rec32 = HardwareAdvisor.recommend(for: profile(total: 32, avail: 24))
+    check("32GB → stronger coder text", rec32.chatModel == "qwen2.5-coder:7b")
+    check("32GB → qwen3-vl grounding", rec32.groundingModel == "qwen3-vl:8b")
+    check("32GB keeps grounding resident", rec32.keepsGroundingResident)
+    let rec4 = HardwareAdvisor.recommend(for: profile(total: 4, avail: 2))
+    check("4GB → tiny 1b text", rec4.chatModel == "llama3.2:1b")
+    check("fits(): moondream alone fits 6GB", HardwareAdvisor.fits(["moondream"], inBudgetGB: 6))
+    check("fits(): three big models don't fit 6GB",
+          !HardwareAdvisor.fits(["llama3.2:3b", "moondream", "qwen2.5vl:3b"], inBudgetGB: 6))
+    check("catalog: moondream known", ModelCatalog.model(named: "moondream") != nil)
+    check("catalog: unknown model → safe residentGB estimate", ModelCatalog.residentGB(of: "mystery:99b") == 4.0)
+
+    // --- AutotuneBridge: tolerant model-id parsing ---
+    let sample = "Recommended (balanced): qwen2.5-coder:7b — MMLU 84%, fits in 6.2 GB. Runs at 9:30."
+    check("autotune parse: picks model id, not the time",
+          AutotuneBridge.parseRecommendedModel(from: sample, installed: []) == "qwen2.5-coder:7b")
+    check("autotune parse: nil when no model id",
+          AutotuneBridge.parseRecommendedModel(from: "no models here, just text", installed: []) == nil)
+
+    // --- Ollama pull progress parsing ---
+    let (pp1, pe1) = OllamaClient.parsePullLine("{\"status\":\"downloading\",\"completed\":50,\"total\":100}")
+    check("pull parse: 50% fraction", pp1?.fraction == 0.5 && pe1 == nil)
+    let (pp2, _) = OllamaClient.parsePullLine("{\"status\":\"success\"}")
+    check("pull parse: success → complete", pp2?.isComplete == true)
+    let (pp3, pe3) = OllamaClient.parsePullLine("{\"error\":\"model 'nope' not found\"}")
+    check("pull parse: error surfaced", pp3 == nil && pe3 == "model 'nope' not found")
+    let (pp4, _) = OllamaClient.parsePullLine("   ")
+    check("pull parse: blank line ignored", pp4 == nil)
+
+    // --- Safety: inference is localhost-only (no cloud) ---
+    check("default Ollama endpoint is localhost", LocalModels.defaultOllamaBaseURL.host == "127.0.0.1")
+    check("OllamaClient talks only to localhost", OllamaClient().baseURL.host == "127.0.0.1")
+    check("identity prompt states no-cloud", LocalPrompts.identity.contains("no cloud"))
+
+    print(failures == 0 ? "\nALL PARSER + ROUTER + SEGMENTER + BROWSER + ADVISOR + AGENT TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
     exit(failures == 0 ? 0 : 1)
 }
 
@@ -399,9 +702,162 @@ func runModelList() async {
     print("Vision role default: \(LocalModels.defaultVisionModel)")
 }
 
+/// Prints the native hardware profile + the advisor's model recommendation, plus
+/// whether the optional autotune CLI is installed (the hybrid path).
+func runAdvise() {
+    let profile = HardwareAdvisor.detect()
+    print("=== LocalClicky hardware advisor ===")
+    print("Hardware: \(profile.summary)")
+    print(String(format: "  total RAM: %.1f GB  ·  available now: %.1f GB", profile.totalRAMGB, profile.availableRAMGB))
+    let rec = HardwareAdvisor.recommend(for: profile)
+    print("\nRecommended for this machine:")
+    print("  text:      \(rec.chatModel)")
+    print("  vision:    \(rec.visionModel)")
+    print("  grounding: \(rec.groundingModel)")
+    print("  resident set (kept warm): \(rec.residentModels.joined(separator: ", "))")
+    print("  grounding stays resident: \(rec.keepsGroundingResident)   keep_alive: \(rec.keepAlive)")
+    print("  → \(rec.summary)")
+
+    print("\nautotune CLI (hybrid):")
+    let status = AutotuneBridge.quickStatus()
+    if status.isInstalled {
+        print("  installed at \(status.executablePath ?? "?")  \(status.version ?? "")")
+        print("  (run `autotune recommend` for its full machine-measured suggestion)")
+    } else {
+        print("  not installed — using the native advisor (this is fine).")
+    }
+}
+
+/// Drives the REAL answer pipeline against Ollama, mirroring CompanionManager's
+/// route → model → prompt selection, so the whole brain is verified end-to-end:
+/// text answers, "give text", Moondream screen-describe, qwen2.5vl pointing, and
+/// the two-step screen joke. Exits non-zero if any critical check fails.
+///   localbrain-harness --e2e <image.png>
+func runE2E(imagePath: String) async {
+    let client = OllamaClient()
+    print("=== LocalClicky end-to-end pipeline (real models) ===")
+    guard await client.isServerReachable() else {
+        print("❌ Ollama not reachable. Start it: ollama serve"); exit(1)
+    }
+    guard let imageData = FileManager.default.contents(atPath: imagePath) else {
+        print("❌ couldn't read image at \(imagePath)"); exit(1)
+    }
+    let (w, h) = pngPixelSize(path: imagePath) ?? (1920, 1080)
+    let b64 = imageData.base64EncodedString()
+    var failures = 0
+    func line(_ name: String, _ ok: Bool, _ detail: String = "") {
+        print((ok ? "✅ " : "❌ ") + name + (detail.isEmpty ? "" : "  — \(detail)"))
+        if !ok { failures += 1 }
+    }
+    func ctx() -> ConversationRouter.Context {
+        .init(visionModeSelected: true, screenAvailable: true, previousTurnUsedScreen: false, hasConversationHistory: false)
+    }
+
+    // 1) Plain text question → text model.
+    let q1 = "what's the capital of france"
+    let route1 = ConversationRouter.route(transcript: q1, context: ctx())
+    let a1 = try? await client.streamChat(model: LocalModels.chatModel,
+        messages: [.system(LocalPrompts.textVoiceResponse), .user(q1)],
+        temperature: 0.2, maxTokens: 60, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    line("text: route=.text + non-empty answer", route1 == .text && !(a1?.text.isEmpty ?? true), a1?.text ?? "nil")
+
+    // 2) "give me X in text" → concise honest answer.
+    let q2 = "give me the speed of light in text"
+    let route2 = ConversationRouter.route(transcript: q2, context: ctx())
+    let a2 = try? await client.streamChat(model: LocalModels.chatModel,
+        messages: [.system(LocalPrompts.conciseText), .user(q2)],
+        temperature: 0.1, maxTokens: 40, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    line("give-text: route=.showText + non-empty answer", route2 == .showText && !(a2?.text.isEmpty ?? true), a2?.text ?? "nil")
+
+    // 3) Screen describe → Moondream.
+    let q3 = "what's on my screen"
+    let route3 = ConversationRouter.route(transcript: q3, context: ctx())
+    let a3 = try? await client.streamChat(model: LocalModels.visionModel,
+        messages: [.system(LocalPrompts.screenDescribe(imageWidthInPixels: w, imageHeightInPixels: h)),
+                   .user(q3, imagesBase64: [b64])],
+        temperature: 0.3, maxTokens: 80, contextWindow: LocalModels.visionContextWindow, onText: { _ in })
+    line("screen-describe: route=.screen + Moondream answer", route3 == .screen && !(a3?.text.isEmpty ?? true), a3?.text ?? "nil")
+
+    // 4) Pointing → grounding model + the dedicated directive prompt must always
+    //    return a WELL-FORMED tag: an in-bounds [POINT:x,y] when the target is
+    //    visible, or a clean [POINT:none] when it isn't (both are valid pipeline
+    //    outcomes — the failure mode we're catching is rambling with no tag). The
+    //    target ("search box") is present on the test screenshot, so we expect an
+    //    in-bounds point most of the time and retry a couple times for it.
+    let q4 = "point at the search box"
+    let route4 = ConversationRouter.route(transcript: q4, context: ctx())
+    var pointDetail = "no tag"
+    var wellFormed = false
+    for _ in 0..<3 where !wellFormed {
+        let a4 = try? await client.streamChat(model: LocalModels.groundingModel,
+            messages: [.system(LocalPrompts.screenPointResponse(imageWidthInPixels: w, imageHeightInPixels: h)),
+                       .user(q4, imagesBase64: [b64])],
+            temperature: 0.2, maxTokens: 120, contextWindow: LocalModels.visionContextWindow, onText: { _ in })
+        guard let parsed = a4.map({ PointingTagParser.parse(from: $0.text) }) else { continue }
+        if let center = parsed.centerInImagePixels {
+            pointDetail = "(\(Int(center.x)),\(Int(center.y)))"
+            wellFormed = center.x >= 0 && center.x <= CGFloat(w) && center.y >= 0 && center.y <= CGFloat(h)
+        } else if parsed.label == "none" {
+            pointDetail = "none (no visible target)"
+            wellFormed = true
+        }
+    }
+    line("pointing: route=.screenPoint + well-formed tag (point or none)", route4 == .screenPoint && wellFormed, pointDetail)
+
+    // 5) Two-step screen joke produces a line.
+    let glance = try? await client.streamChat(model: LocalModels.visionModel,
+        messages: [.system(LocalPrompts.screenGlanceSystem), .user(LocalPrompts.screenGlanceUser, imagesBase64: [b64])],
+        temperature: 0.3, maxTokens: 50, contextWindow: LocalModels.visionContextWindow, onText: { _ in })
+    var desc = glance?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if desc.count < 8 { desc = "their computer screen with a few things open" }
+    let joke = try? await client.streamChat(model: LocalModels.chatModel,
+        messages: [.system(LocalPrompts.screenJokeFromDescription),
+                   .user("the user is looking at: \(desc). make the joke.")],
+        temperature: 0.9, maxTokens: 50, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    line("two-step screen joke produces a line", !(joke?.text.isEmpty ?? true), joke?.text ?? "nil")
+
+    print(failures == 0 ? "\nE2E PASSED" : "\n\(failures) E2E CHECK(S) FAILED")
+    exit(failures == 0 ? 0 : 1)
+}
+
+/// Exercises the real web-reach pipeline live: fetch web results (Jina Reader),
+/// then have the local text model synthesize a grounded spoken answer.
+///   localbrain-harness --webreach "who won the 2024 nobel prize in physics"
+func runWebReach(query: String) async {
+    print("=== web reach: \"\(query)\" ===")
+    print("fetching (https://r.jina.ai/ … the one opt-in cloud call)…")
+    guard let results = await WebReachTool.search(query), !results.isEmpty else {
+        print("❌ web fetch failed (no connection, or the reader was unreachable)"); exit(1)
+    }
+    print("✅ fetched \(results.count) chars of results")
+    let client = OllamaClient()
+    guard await client.isServerReachable() else { print("(Ollama not running — can't synthesize)"); exit(1) }
+    let answer = try? await client.streamChat(
+        model: LocalModels.chatModel,
+        messages: [.system(LocalPrompts.webAnswer),
+                   .user("question: \(query)\n\nweb results:\n\(results)")],
+        temperature: 0.3, maxTokens: 180, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    print("\nanswer: \(answer?.text ?? "nil")")
+    exit((answer?.text.isEmpty == false) ? 0 : 1)
+}
+
 func runHarness() async {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments.first == "--selftest" { runSelfTest() }
+    if arguments.first == "--advise" {
+        runAdvise()
+        return
+    }
+    if arguments.first == "--webreach" {
+        guard arguments.count >= 2 else { print("usage: localbrain-harness --webreach \"<query>\""); exit(1) }
+        await runWebReach(query: arguments[1])
+        return
+    }
+    if arguments.first == "--e2e" {
+        guard arguments.count >= 2 else { print("usage: localbrain-harness --e2e <image.png>"); exit(1) }
+        await runE2E(imagePath: arguments[1])
+        return
+    }
     if arguments.first == "--models" {
         await runModelList()
         return
@@ -410,6 +866,15 @@ func runHarness() async {
         let benchImage = arguments.count >= 2 ? arguments[1] : nil
         let iterations = arguments.count >= 3 ? (Int(arguments[2]) ?? 3) : 3
         await runBenchmark(imagePath: benchImage, iterations: iterations)
+        return
+    }
+    if arguments.first == "--benchmark-suite" {
+        guard arguments.count >= 2 else {
+            print("usage: localbrain-harness --benchmark-suite <image.png> [iterations] [label]"); exit(1)
+        }
+        let iterations = arguments.count >= 3 ? (Int(arguments[2]) ?? 3) : 3
+        let label = arguments.count >= 4 ? arguments[3] : "baseline"
+        await runBenchmarkSuite(imagePath: arguments[1], iterations: iterations, label: label)
         return
     }
     let imagePath = arguments.first

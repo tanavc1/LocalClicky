@@ -8,7 +8,7 @@ is HTTP to a local Ollama server on `127.0.0.1:11434`.
 
 | Target | Kind | Role |
 |---|---|---|
-| `LocalBrainKit` | library | The no‑UI "brain": Ollama client (incl. installed‑model listing + capability detection), `[POINT]` parser, prompts, model config + roles, conversation router, spoken‑text segmenter, browser‑ and app‑command planners. Pure logic, unit‑testable, no AppKit. |
+| `LocalBrainKit` | library | The no‑UI "brain": Ollama client (installed‑model listing, capability detection, streaming model `pull`), format‑robust `[POINT]` parser, prompts, model config + roles, conversation router, spoken‑text segmenter, browser‑ and app‑command planners, `HardwareAdvisor` + `AutotuneBridge` (hardware‑aware model recommendation), and `WebReachTool` (the opt‑in web lookup). Pure logic, unit‑testable, no AppKit. |
 | `CSherpaOnnx` | C target | Thin module exposing the sherpa‑onnx C API (neural TTS) to Swift. Implementations come from the vendored dylib the app links. |
 | `LocalClicky` | executable (app) | The menu‑bar SwiftUI/AppKit app: overlay, panel, capture, push‑to‑talk, neural voice, browser executor, `CompanionManager`. |
 | `localbrain-harness` | executable (CLI) | Runs the full local pipeline against the real models, headless, for verification. |
@@ -32,20 +32,31 @@ is HTTP to a local Ollama server on `127.0.0.1:11434`.
    instead of the screenshot hijacking the answer. It's a fast heuristic — no extra
    model call — so it also saves latency by skipping the VLM when the screen isn't
    needed. Action turns skip inference entirely (see [Actions](#actions)).
-5. **Inference** — `CompanionManager` builds an Ollama chat request using the
-   currently‑selected model for the role:
-   - **Screen turn**: system prompt + history + the user turn with the screenshot
-     attached, sent to the **vision model** (default `qwen2.5vl:3b`).
-   - **Text turn**: no image, sent to the **text model** (default `llama3.2:3b`).
+   The router has five non‑action question routes: **`.screen`** (describe what's
+   on screen), **`.screenPoint`** (point at a UI element — "where do I click"),
+   **`.text`** (self‑contained / follow‑up), **`.showText`** ("give me X in text"
+   → a concise answer in the blue side‑text), and **`.webReach`** (the opt‑in
+   internet lookup). A "where do I click to open settings" question is detected as
+   pointing *first*, so the app/browser launcher never hijacks it.
+5. **Inference** — `CompanionManager` builds an Ollama chat request per route:
+   - **`.screen`** (describe): screenshot + the `screenDescribe` prompt, sent to the
+     **vision model** (default `moondream` — strong at description, doesn't ground).
+   - **`.screenPoint`** (point): screenshot + the directive `screenPointResponse`
+     prompt, sent to the **grounding model** (default `qwen2.5vl:3b`), which returns
+     a `[POINT:x,y]` ~9/10 of the time (measured; up from ~1/2).
+   - **`.text` / `.showText` / `.webReach`**: no image, sent to the **text model**
+     (default `llama3.2:3b`).
    `OllamaClient.streamChat` streams the reply and reports first‑token latency and
-   decode tok/s. Every call uses the **same** `num_ctx`
-   (`LocalModels.defaultContextWindow`, 8192) — roomy enough that a screenshot plus
-   several turns of history can't overrun the context, and identical across roles so
-   Ollama never reloads a model for a different context size (which would otherwise
-   cost a multi‑second reload every time one model serves both roles).
-6. **Pointing** — `PointingTagParser` pulls the `[POINT:x,y:label]` tag (or the
-   VLM's native `[x1,y1,x2,y2:label]` bounding box, collapsed to its center) out of
-   the reply. The remaining text is what gets spoken.
+   decode tok/s. Each **model** gets a consistent, **per‑role** `num_ctx` — a snug
+   4096 for the text model, a roomy 8192 for vision/grounding (a screenshot +
+   history is token‑heavy). Because text and vision are different models, this never
+   triggers a reload; when one VLM fills both roles it gets the roomy window in
+   both (`CompanionManager.contextWindow(forModel:)`). The smaller text KV cache is
+   what lets the `HardwareAdvisor` keep **two models resident** on 16 GB.
+6. **Pointing** — `PointingTagParser` pulls the pointing tag out of the reply. It
+   accepts the classic `[POINT:x,y:label]`, qwen2.5‑vl's attribute form
+   `[POINT x="x" y="y"]`, and a bare `[x1,y1,x2,y2:label]` box (collapsed to its
+   center). The remaining text is what gets spoken.
 7. **Cursor** — the image‑pixel point is mapped to a global AppKit coordinate on
    the captured display (`CompanionManager.globalScreenLocation(forImagePoint:in:)`)
    and published as `detectedElementScreenLocation` /
@@ -152,7 +163,30 @@ Latency work (verified before/after):
   latency benefit (first token already ~0.17 s) while hurting pointing accuracy.
 
 Ollama keeps models warm (`keep_alive`), so the cold load is a one‑time cost per
-model per session. Pointing accuracy on the synthetic test UI: ~14–20 px error.
+model per session.
+
+## Public‑release subsystems
+
+- **Hardware advisor + autotune (hybrid).** `HardwareAdvisor` (native, always
+  works) detects RAM/cores, holds a curated model catalog with resident‑RAM
+  footprints, and recommends the best models per role + which to keep resident.
+  `AutotuneBridge` detects the optional [`autotune`](https://autotunellm.com) CLI
+  and layers its recommendation on top. Drives the warm‑up set, the per‑role
+  `num_ctx`, `keep_alive`, and a non‑invasive blue‑text suggestion when a better
+  model fits. See `localbrain-harness --advise`.
+- **In‑app model + Ollama setup.** `OllamaClient.pullModel` streams `/api/pull`
+  (dedicated long‑timeout session); `OllamaInstaller` detects/downloads Ollama.
+  The panel offers a **Download Ollama** button and a fit‑gated **Add a model**
+  dropdown → download with progress → warm into RAM.
+- **First‑run + blue side‑text.** No onboarding video/music. `companionSideText`
+  drives a streamed first‑run intro, a two‑step screen‑aware joke (Moondream
+  describes → text model jokes), "give me X in text" answers, and model tips.
+- **Web reach (opt‑in, the one cloud exception).** `WebReachTool` does keyless web
+  read + search via Jina Reader (`r.jina.ai`); the local text model summarizes.
+  Only the `.webReach` route triggers it, and the UI shows "checking the web…".
+
+Pointing accuracy on the synthetic test UI: ~14–20 px error; tag‑return rate ~9/10
+(see `docs/benchmarks/`).
 
 ## What's verified vs. what needs a human at the GUI
 
