@@ -231,7 +231,41 @@ final class CompanionManager: ObservableObject {
         // the intro + screen-aware joke in the blue side-text beside the cursor).
         if allPermissionsGranted && isClickyCursorEnabled {
             presentOverlayAndIntroIfNeeded()
+            // A bit later, gently suggest a better-fit model if there is one —
+            // non-invasive blue text, shown at most once per distinct suggestion,
+            // and skipped while the intro/joke is still on screen.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
+                self?.maybeShowModelRecommendation()
+            }
         }
+    }
+
+    /// True once the recommendation has been shown this launch (don't repeat it).
+    private var hasShownRecommendationThisLaunch = false
+
+    /// Non-invasive autotune-style recommendation: if the advisor's best-fit
+    /// models for this Mac differ from what's currently selected, gently suggest
+    /// the switch in the blue side-text. Shown at most once per distinct
+    /// recommendation (a UserDefaults signature prevents nagging across launches),
+    /// never while other side-text is up, and it auto-dismisses — it can't block
+    /// anything. Credits `autotune` when the CLI is installed.
+    func maybeShowModelRecommendation() {
+        guard isOverlayVisible, companionSideText == nil, !hasShownRecommendationThisLaunch else { return }
+        let rec = hardwareRecommendation
+        let differs = (chatModelName != rec.chatModel) || (visionModelName != rec.visionModel)
+        guard differs else { return }
+
+        let target = chatModelName != rec.chatModel ? rec.chatModel : rec.visionModel
+        let source = autotuneStatus.isInstalled ? "autotune" : "tip"
+        let gb = Int(hardwareProfile.totalRAMGB.rounded())
+        let message = "\(source): \(target) is a great fit for your \(gb) gb mac — switch it in the menu-bar panel under models."
+
+        let signature = "\(rec.chatModel)|\(rec.visionModel)"
+        let key = "localClicky.lastRecommendationShown"
+        guard UserDefaults.standard.string(forKey: key) != signature else { return }
+        UserDefaults.standard.set(signature, forKey: key)
+        hasShownRecommendationThisLaunch = true
+        streamSideText(message, characterInterval: 0.02, holdSeconds: 9, autoDismiss: true)
     }
 
     /// Shows the cursor overlay and, the very first time, kicks off the blue-text
