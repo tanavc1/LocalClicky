@@ -22,21 +22,37 @@ public enum LocalModels {
     /// screen. ~2 GB, decodes quickly on M-series GPUs.
     public static let defaultChatModel = "llama3.2:3b"
 
-    /// Default vision-language model that both answers questions about the screen
-    /// and grounds UI elements (returns pixel coordinates) so the blue cursor can
-    /// fly to them. ~3.2 GB. This is the local replacement for the cloud vision
-    /// model in the original Clicky.
-    public static let defaultVisionModel = "qwen2.5vl:3b"
+    /// Default vision-language model that *describes/answers* about the screen
+    /// (and powers the screen-aware joke + "give text" about what's visible).
+    /// ~1.7 GB — small, fast, and strong at description/VQA. It does **not** emit
+    /// pixel coordinates, so pointing turns are routed to `defaultGroundingModel`
+    /// instead (see ConversationRouter `.screenPoint`). Measured in
+    /// docs/benchmarks/baseline-*.md.
+    public static let defaultVisionModel = "moondream"
+
+    /// Default grounding model used only for *pointing* turns — it returns the
+    /// pixel coordinates that fly the blue cursor to a UI element. ~3.2 GB and
+    /// reliably grounds, which Moondream cannot do. Loaded on demand (or kept
+    /// resident on machines with enough RAM — the HardwareAdvisor decides).
+    public static let defaultGroundingModel = "qwen2.5vl:3b"
 
     /// Backwards-compatible aliases (the harness + bootstrap script refer to
     /// these). They are exactly the defaults above.
     public static let chatModel = defaultChatModel
     public static let visionModel = defaultVisionModel
+    public static let groundingModel = defaultGroundingModel
 
     /// Every model the app needs present in Ollama to run fully with the default
     /// configuration. (When the user picks custom models, the *selected* models
     /// are what's checked instead — see `OllamaClient.modelInstalled`.)
+    /// The grounding model is *recommended* (pointing degrades gracefully to a
+    /// description without it) so it isn't in the hard-required set.
     public static let requiredModels = [defaultChatModel, defaultVisionModel]
+
+    /// The full default arrangement, including the grounding model. Used by the
+    /// download flow + engine-status nudge so the signature pointing feature
+    /// works out of the box on a fresh install.
+    public static let recommendedModels = [defaultChatModel, defaultVisionModel, defaultGroundingModel]
 
     /// A single, consistent `num_ctx` used for *every* request — text, vision, and
     /// warm-up alike. It has to be roomy enough that a screenshot plus several
@@ -52,6 +68,17 @@ public enum LocalModels {
     /// Default local Ollama endpoint. Overridable so a user running Ollama on a
     /// non-standard port can point the app at it.
     public static let defaultOllamaBaseURL = URL(string: "http://127.0.0.1:11434")!
+
+    /// Whether a vision model can plausibly return pixel coordinates for pointing.
+    /// Ollama doesn't expose a "grounding" capability, so this is a deliberately
+    /// conservative heuristic: Moondream describes well but cannot ground (it
+    /// returns empty output when asked for coordinates — see the baseline
+    /// benchmark), so its family is excluded. Everything else is assumed capable
+    /// and simply tried. Used so a pointing turn never asks a known-non-grounding
+    /// model for coordinates it can't produce.
+    public static func isLikelyGroundingCapable(_ model: String) -> Bool {
+        !model.lowercased().contains("moondream")
+    }
 }
 
 /// What a model must be able to do to fill a given LocalClicky role. Used by the

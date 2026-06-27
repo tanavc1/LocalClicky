@@ -67,6 +67,11 @@ final class CompanionManager: ObservableObject {
     /// of the role (see the model picker). Persisted via ModelPreferences.
     @Published private(set) var chatModelName: String = ModelPreferences.chatModel
     @Published private(set) var visionModelName: String = ModelPreferences.visionModel
+    /// The grounding model used for *pointing* turns (the blue cursor's
+    /// coordinates). The default vision model (Moondream) can't ground, so
+    /// pointing routes here. Loaded on demand unless the advisor keeps it
+    /// resident (see warm-up + Phase 4 residency).
+    @Published private(set) var groundingModelName: String = ModelPreferences.groundingModel
 
     /// Every model installed in the user's Ollama, for the model picker, plus the
     /// subset that can accept images — so the vision role can only ever be filled
@@ -302,11 +307,22 @@ final class CompanionManager: ObservableObject {
         refreshLocalEngineStatus()
     }
 
+    /// The model to use for a pointing turn: the dedicated grounding model when
+    /// it's installed, otherwise the main vision model (best effort — it may not
+    /// actually ground). Kept in one place so the answer pipeline and any warm-up
+    /// agree on which model pointing uses.
+    private func resolvedGroundingModelName() -> String {
+        guard !installedModels.isEmpty else { return groundingModelName }
+        let names = installedModels.map { $0.name }
+        return OllamaClient.modelInstalled(groundingModelName, among: names) ? groundingModelName : visionModelName
+    }
+
     /// Restores both roles to LocalClicky's default models.
     func resetModelsToDefaults() {
         ModelPreferences.resetToDefaults()
         chatModelName = ModelPreferences.chatModel
         visionModelName = ModelPreferences.visionModel
+        groundingModelName = ModelPreferences.groundingModel
         warmUpLocalModels()
         refreshLocalEngineStatus()
     }
@@ -650,7 +666,8 @@ final class CompanionManager: ObservableObject {
                     return
                 }
 
-                let useScreen = (route == .screen)
+                let useScreen = (route == .screen || route == .screenPoint)
+                let wantsPointing = (route == .screenPoint)
 
                 var cursorScreenCapture: CompanionScreenCapture?
                 let systemPrompt: String
@@ -660,11 +677,30 @@ final class CompanionManager: ObservableObject {
                 if useScreen, let capture = try? await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG() {
                     cursorScreenCapture = capture
                     userImagesBase64 = [capture.imageData.base64EncodedString()]
-                    systemPrompt = LocalPrompts.screenVoiceResponse(
-                        imageWidthInPixels: capture.screenshotWidthInPixels,
-                        imageHeightInPixels: capture.screenshotHeightInPixels
-                    )
-                    model = visionModelName
+                    if wantsPointing {
+                        // Pointing turn: use the grounding model + the pointing
+                        // prompt. If the resolved model can't ground (grounding
+                        // model not installed and the vision model is Moondream),
+                        // describe instead of asking it for empty coordinates.
+                        let pointingModel = resolvedGroundingModelName()
+                        if LocalModels.isLikelyGroundingCapable(pointingModel) {
+                            systemPrompt = LocalPrompts.screenVoiceResponse(
+                                imageWidthInPixels: capture.screenshotWidthInPixels,
+                                imageHeightInPixels: capture.screenshotHeightInPixels)
+                        } else {
+                            systemPrompt = LocalPrompts.screenDescribe(
+                                imageWidthInPixels: capture.screenshotWidthInPixels,
+                                imageHeightInPixels: capture.screenshotHeightInPixels)
+                        }
+                        model = pointingModel
+                    } else {
+                        // Describe/answer turn: the default vision model (Moondream),
+                        // which is strong at description but doesn't emit coordinates.
+                        systemPrompt = LocalPrompts.screenDescribe(
+                            imageWidthInPixels: capture.screenshotWidthInPixels,
+                            imageHeightInPixels: capture.screenshotHeightInPixels)
+                        model = visionModelName
+                    }
                 } else {
                     systemPrompt = LocalPrompts.textVoiceResponse
                     model = chatModelName

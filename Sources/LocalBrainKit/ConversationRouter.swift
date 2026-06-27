@@ -25,7 +25,13 @@
 import Foundation
 
 public enum ConversationRoute: Equatable, Sendable {
+    /// Capture the screen and *describe/answer* about it (the default vision
+    /// model, e.g. Moondream). No coordinates expected.
     case screen
+    /// Capture the screen and *point* at a UI element — the user asked where to
+    /// click / find something. Routed to the grounding model (e.g. qwen2.5vl)
+    /// which returns the pixel coordinates that fly the blue cursor.
+    case screenPoint
     case text
     case browserCommand
     /// Open / launch a local macOS application ("launch spotify", "open the
@@ -82,7 +88,40 @@ public enum ConversationRouter {
         // 3) Vision mode with the screen available is the default. Only divert to
         //    the text model when the turn is clearly self-contained.
         if isClearlyTextOnly(text, context: context) { return .text }
+        // 4) Distinguish "point at / where do I click" (needs grounding coords)
+        //    from "describe / what's on screen" (the default vision model). The
+        //    two use different models + prompts since Moondream can't ground.
+        if wantsPointing(text) { return .screenPoint }
         return .screen
+    }
+
+    // MARK: - Pointing vs describing
+
+    /// True when the user wants the blue cursor to *point* at something on screen
+    /// (where to click, find a button, etc.) rather than just hear it described.
+    /// Tightly phrased so "what does this button do" stays a describe turn.
+    static func wantsPointing(_ text: String) -> Bool {
+        let pointingPhrases = [
+            "point at", "point to", "point me", "point out", "point the",
+            "show me where", "show me how to get to",
+            "where do i", "where should i", "where can i", "where to click",
+            "where is the", "where's the", "where is it", "where's it", "where are the",
+            "how do i get to", "how do i find",
+            "which button", "which one", "which icon", "which tab", "which option", "which menu",
+            "highlight the", "highlight ",
+        ]
+        if pointingPhrases.contains(where: text.contains) { return true }
+        // Imperative "click ..." that targets a UI element.
+        if text.hasPrefix("click ") || text.contains(" click the") || text.contains(" click on")
+            || text.contains("where do i click") {
+            return true
+        }
+        // A UI noun paired with a find/locate/where cue.
+        let uiNouns = [" button", " menu", " icon", " toolbar", " field", " checkbox",
+                       " dropdown", " text box", " text field", " slider", " tab", " link", " option"]
+        let locateCue = text.contains("find ") || text.contains("locate ") || text.contains("where")
+        if locateCue && uiNouns.contains(where: text.contains) { return true }
+        return false
     }
 
     // MARK: - Clipboard

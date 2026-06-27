@@ -43,6 +43,26 @@ public enum LocalPrompts {
         """
     }
 
+    /// Screen *describe/answer* prompt for the default vision model (Moondream),
+    /// used when the user asks about what's on screen but isn't asking where to
+    /// click. Deliberately has **no** pointing instructions: Moondream is strong
+    /// at description but does not emit coordinates, so asking it to would just
+    /// produce empty/garbled output (see docs/benchmarks/baseline-*.md). Pointing
+    /// turns go to the grounding model via `screenVoiceResponse` instead.
+    public static func screenDescribe(imageWidthInPixels: Int, imageHeightInPixels: Int) -> String {
+        """
+        \(identity)
+
+        right now the user spoke to you and you're looking at a screenshot of their screen. your reply is read aloud by text-to-speech, so talk like a person.
+
+        rules:
+        - keep it to one or two short sentences unless they ask you to go deeper. all lowercase, casual, warm. no emojis, no markdown, no lists.
+        - answer about what you actually see on screen. write for the ear: spell out small numbers, say "for example" not "e.g.", never read code out verbatim — describe it.
+        - if it's a follow-up and the screen isn't relevant, just answer from the conversation.
+        - never say "simply" or "just". do not output coordinates or any bracketed tags.
+        """
+    }
+
     /// Text-only prompt for the fast chat model, used when there's no useful
     /// screen context. Mirrors the screen prompt's voice but tells the model it
     /// can't see the screen this turn and to lean on conversation history — which
