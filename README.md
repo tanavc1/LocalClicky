@@ -2,6 +2,10 @@
 
 **A fully local, no-cloud rebuild of [Clicky](https://github.com/farzaa/clicky).**
 
+Credit to [Farza](https://github.com/farzaa) for open-sourcing Clicky and
+[Shrey Patel](https://github.com/ShreyPatel4) for the initial
+[local-mode PR](https://github.com/farzaa/clicky/pull/115).
+
 Clicky is an AI buddy that lives next to your cursor: you hold a hotkey and talk
 to it, it sees your screen, answers out loud, and a little blue cursor flies over
 to point at the thing you asked about. The original sends your voice, your
