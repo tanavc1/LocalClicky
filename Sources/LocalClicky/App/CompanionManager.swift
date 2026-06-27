@@ -875,6 +875,11 @@ final class CompanionManager: ObservableObject {
                     settleAfterAction()
                     return
                 }
+                if route == .webReach {
+                    await handleWebReachCommand(transcript: transcript)
+                    settleAfterAction()
+                    return
+                }
 
                 let useScreen = (route == .screen || route == .screenPoint)
                 let wantsPointing = (route == .screenPoint)
@@ -1156,6 +1161,67 @@ final class CompanionManager: ObservableObject {
         voiceState = .responding
         do { try await speechSynthesizer.speakText(answer) }
         catch { print("⚠️ TTS error during give-text: \(error)") }
+    }
+
+    // MARK: - Web reach (the one opt-in internet feature)
+
+    /// Answers an internet-needing question: fetches web results via WebReachTool
+    /// (Jina Reader — the one documented cloud call), then has the local text
+    /// model synthesize a spoken answer grounded only in what was fetched. Shows
+    /// "checking the web…" in the blue text first, since this is the single
+    /// feature that leaves the no-cloud guarantee.
+    private func handleWebReachCommand(transcript: String) async {
+        voiceState = .processing
+        streamSideText("checking the web…", autoDismiss: false)
+
+        let results = await WebReachTool.search(transcript)
+        guard !Task.isCancelled else { dismissSideText(); return }
+
+        guard let results, !results.isEmpty else {
+            dismissSideText()
+            previousTurnUsedScreen = false
+            let message = "i couldn't reach the web just now — check your connection and try again."
+            voiceState = .responding
+            do { try await speechSynthesizer.speakText(message) }
+            catch { print("⚠️ TTS error during web-reach: \(error)") }
+            return
+        }
+
+        var answer = ""
+        do {
+            let synthesis = try await ollamaClient.streamChat(
+                model: chatModelName,
+                messages: [.system(LocalPrompts.webAnswer),
+                           .user("question: \(transcript)\n\nweb results:\n\(results)")],
+                temperature: 0.3,
+                maxTokens: 180,
+                keepAlive: hardwareRecommendation.keepAlive,
+                contextWindow: contextWindow(forModel: chatModelName),
+                onText: { _ in })
+            answer = synthesis.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch is CancellationError {
+            dismissSideText(); return
+        } catch {
+            print("⚠️ web-reach synthesis error: \(error)")
+            refreshLocalEngineStatus()
+        }
+
+        dismissSideText()
+        conversationHistory.append((userTranscript: transcript, assistantResponse: answer))
+        if conversationHistory.count > 10 { conversationHistory.removeFirst(conversationHistory.count - 10) }
+        previousTurnUsedScreen = false
+
+        guard !answer.isEmpty else {
+            let message = "i found some pages but couldn't pull an answer out of them."
+            voiceState = .responding
+            do { try await speechSynthesizer.speakText(message) }
+            catch { print("⚠️ TTS error during web-reach: \(error)") }
+            return
+        }
+        lastSpokenAnswer = answer
+        voiceState = .responding
+        do { try await speechSynthesizer.speakText(answer) }
+        catch { print("⚠️ TTS error during web-reach: \(error)") }
     }
 
     // MARK: - First-run intro (blue side-text) + screen-aware joke

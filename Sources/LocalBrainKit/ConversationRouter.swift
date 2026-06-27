@@ -43,6 +43,10 @@ public enum ConversationRoute: Equatable, Sendable {
     /// Show a concise, honest answer in the blue side-text beside the cursor
     /// ("give me X in text", "give text", "show me the text").
     case showText
+    /// Answer a question that needs the live internet ("look it up online",
+    /// "what's the latest…"). Fetches + synthesizes via WebReachTool. This is the
+    /// one route that leaves the no-cloud guarantee, so it's narrowly triggered.
+    case webReach
 }
 
 public enum ConversationRouter {
@@ -87,6 +91,10 @@ public enum ConversationRouter {
         //    a2) "give me X in text" / "give text" — answer in the blue side-text.
         if wantsShowText(text) { return .showText }
         if !isPointingQuestion {
+            //    a3) "look it up online" / "what's the latest…" — fetch from the
+            //        web and answer. Checked before the browser so "search the web
+            //        and tell me" gets an answer instead of just opening a tab.
+            if wantsWebReach(text) { return .webReach }
             //    b) "launch spotify" / "open the notes app" — open an installed app.
             //       Checked before the browser so explicit app phrasing isn't read
             //       as a website (e.g. "launch spotify" opens the app, not the site).
@@ -171,6 +179,23 @@ public enum ConversationRouter {
             "write it out", "give me the text", "text it to me", "text me the",
         ]
         return phrases.contains(where: text.contains)
+    }
+
+    // MARK: - Web reach (the one internet-answering route)
+
+    /// True when the user clearly wants info *from the live internet* answered
+    /// back to them (not just a site opened). Conservative on purpose — this is
+    /// the only route that leaves the no-cloud guarantee, so it must require an
+    /// explicit internet marker, never fire on a plain local question.
+    static func wantsWebReach(_ text: String) -> Bool {
+        let markers = [
+            "online", "on the internet", "on the web", "from the web", "from the internet",
+            "the latest", "latest news", "what's new with", "whats new with",
+            "what does the internet say", "search the internet", "search the web and",
+            "look it up online", "look that up online", "look this up online",
+            "check the web", "check online", "google it and tell", "according to the internet",
+        ]
+        return markers.contains(where: text.contains)
     }
 
     // MARK: - Browser commands

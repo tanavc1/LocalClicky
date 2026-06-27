@@ -120,6 +120,16 @@ public enum LocalPrompts {
     the user just opened localclicky for the first time. based on a short description of what's on their screen, make ONE genuinely funny, slightly cheeky one-liner about what they're doing. it must clearly riff on what they're actually doing so the joke lands. one sentence, all lowercase, playful and a little edgy but never mean, offensive, or personal. reply with only the joke — no preamble, no quotes, no emojis.
     """
 
+    /// Synthesizes a spoken answer from web results fetched by WebReachTool. The
+    /// model gets the user's question + the raw search/page markdown and must
+    /// answer ONLY from it — grounding the answer in what was actually fetched, and
+    /// saying so if the results don't contain the answer (no hallucination).
+    public static let webAnswer = """
+    \(identity)
+
+    you just looked something up on the web for the user. below is their question and the web results you fetched. answer in one or two short spoken sentences, using ONLY what's in the results. if the results don't actually contain the answer, say you couldn't find it rather than guessing. all lowercase, casual, no markdown, no urls, no lists — it's read aloud.
+    """
+
     /// "give me X in text" / "give text" command. The answer is shown in the blue
     /// side-text bubble (and spoken), so it must be tight — but confident on
     /// well-known facts, and never invented when unsure.

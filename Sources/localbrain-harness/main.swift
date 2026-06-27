@@ -566,6 +566,17 @@ func runSelfTest() -> Never {
           route("give me pi in text", ctx(vision: false)) == .showText)
     check("plain question is NOT showText", route("what's the capital of france", ctx()) == .text)
 
+    // --- Web reach (the one internet-answering route) ---
+    check("'what's the latest … online' → webReach",
+          route("what's the latest on the mars mission online", ctx()) == .webReach)
+    check("'look it up online' → webReach", route("look it up online for me", ctx()) == .webReach)
+    check("'search the web and tell me' → webReach",
+          route("search the web and tell me who won", ctx()) == .webReach)
+    check("plain local question is NOT webReach", route("what's the capital of france", ctx()) == .text)
+    check("'open gmail' still → browserCommand (not webReach)", route("open gmail", ctx()) == .browserCommand)
+    check("webReach search URL targets r.jina.ai", WebReachTool.searchURL(for: "nobel prize")?.host == "r.jina.ai")
+    check("webReach read URL targets r.jina.ai", WebReachTool.readURL(for: "example.com")?.host == "r.jina.ai")
+
     // --- Prompt integrity (describe vs point vs honest concise) ---
     check("conciseText forbids made-up facts", LocalPrompts.conciseText.contains("never make up"))
     check("screenDescribe has NO pointing instruction",
@@ -809,11 +820,37 @@ func runE2E(imagePath: String) async {
     exit(failures == 0 ? 0 : 1)
 }
 
+/// Exercises the real web-reach pipeline live: fetch web results (Jina Reader),
+/// then have the local text model synthesize a grounded spoken answer.
+///   localbrain-harness --webreach "who won the 2024 nobel prize in physics"
+func runWebReach(query: String) async {
+    print("=== web reach: \"\(query)\" ===")
+    print("fetching (https://r.jina.ai/ … the one opt-in cloud call)…")
+    guard let results = await WebReachTool.search(query), !results.isEmpty else {
+        print("❌ web fetch failed (no connection, or the reader was unreachable)"); exit(1)
+    }
+    print("✅ fetched \(results.count) chars of results")
+    let client = OllamaClient()
+    guard await client.isServerReachable() else { print("(Ollama not running — can't synthesize)"); exit(1) }
+    let answer = try? await client.streamChat(
+        model: LocalModels.chatModel,
+        messages: [.system(LocalPrompts.webAnswer),
+                   .user("question: \(query)\n\nweb results:\n\(results)")],
+        temperature: 0.3, maxTokens: 180, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+    print("\nanswer: \(answer?.text ?? "nil")")
+    exit((answer?.text.isEmpty == false) ? 0 : 1)
+}
+
 func runHarness() async {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments.first == "--selftest" { runSelfTest() }
     if arguments.first == "--advise" {
         runAdvise()
+        return
+    }
+    if arguments.first == "--webreach" {
+        guard arguments.count >= 2 else { print("usage: localbrain-harness --webreach \"<query>\""); exit(1) }
+        await runWebReach(query: arguments[1])
         return
     }
     if arguments.first == "--e2e" {
