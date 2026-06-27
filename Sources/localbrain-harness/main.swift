@@ -199,6 +199,207 @@ func runBenchmark(imagePath: String?, iterations: Int) async {
     }
 }
 
+// MARK: - Benchmark suite (structured, reproducible before/after)
+
+/// One model's measured numbers, JSON-encoded into the report so before/after
+/// runs can be diffed mechanically rather than eyeballed.
+struct BenchRunResult: Codable {
+    let model: String
+    let role: String                 // "text" | "vision"
+    let samples: Int                 // prompt runs that succeeded
+    let meanFirstTokenSeconds: Double
+    let meanTotalSeconds: Double
+    let meanTokensPerSecond: Double
+    let pointParseRate: Double       // fraction that returned a [POINT] tag (vision)
+    let pointInBoundsRate: Double    // fraction whose coords landed inside the image (vision)
+}
+
+/// The full report written to docs/benchmarks/. Captures enough provenance
+/// (commit, image, hardware snapshot) that a run is meaningful months later.
+struct BenchSuiteReport: Codable {
+    let label: String                // "baseline" | "after" | custom
+    let timestamp: String
+    let gitCommit: String
+    let image: String
+    let imageWidth: Int
+    let imageHeight: Int
+    let iterations: Int
+    let textModel: String
+    let visionModel: String
+    let ollamaPs: String
+    let results: [BenchRunResult]
+}
+
+/// Shells out to a command and returns its trimmed stdout (best-effort, "" on failure).
+/// Used for `ollama ps` (resident-model RAM snapshot) and the git commit stamp.
+func shellCapture(_ command: String, _ arguments: [String]) -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = [command] + arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+    do { try process.run() } catch { return "" }
+    process.waitUntilExit()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    return (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Benchmarks the text model on a few representative prompts (latency only).
+func benchTextModel(_ client: OllamaClient, model: String, prompts: [String], iterations: Int) async -> BenchRunResult {
+    var samples = LatencySamples()
+    // Discard one warm-up so steady-state numbers aren't polluted by model load.
+    _ = try? await client.streamChat(model: model, messages: [.system(LocalPrompts.textVoiceResponse), .user("hi")],
+                                     temperature: 0.2, maxTokens: 8, onText: { _ in })
+    for prompt in prompts {
+        for _ in 0..<iterations {
+            if let result = try? await client.streamChat(
+                model: model,
+                messages: [.system(LocalPrompts.textVoiceResponse), .user(prompt)],
+                temperature: 0.2, maxTokens: 100, onText: { _ in }) {
+                samples.record(result)
+            }
+        }
+    }
+    return BenchRunResult(model: model, role: "text", samples: samples.total.count,
+                          meanFirstTokenSeconds: samples.meanFirstToken,
+                          meanTotalSeconds: samples.meanTotal,
+                          meanTokensPerSecond: samples.meanTokensPerSecond,
+                          pointParseRate: 0, pointInBoundsRate: 0)
+}
+
+/// Benchmarks one vision model on UI-grounding prompts. Beyond latency, it
+/// measures how often the model returns a *parseable* [POINT] tag and how often
+/// those coordinates land inside the image — an honest, reproducible proxy for
+/// "can the blue cursor actually rely on this model to point" (true target
+/// accuracy would need hand-labeled ground truth, which this does not claim).
+func benchVisionModel(_ client: OllamaClient, model: String, imageBase64: String,
+                      width: Int, height: Int, prompts: [String], iterations: Int) async -> BenchRunResult {
+    let systemPrompt = LocalPrompts.screenVoiceResponse(imageWidthInPixels: width, imageHeightInPixels: height)
+    var samples = LatencySamples()
+    var parsed = 0, inBounds = 0, attempts = 0
+    // Warm-up (discarded).
+    _ = try? await client.streamChat(model: model,
+        messages: [.system(systemPrompt), .user(prompts.first ?? "what's on screen?", imagesBase64: [imageBase64])],
+        temperature: 0.2, maxTokens: 160, onText: { _ in })
+    for prompt in prompts {
+        for _ in 0..<iterations {
+            attempts += 1
+            guard let result = try? await client.streamChat(
+                model: model,
+                messages: [.system(systemPrompt), .user(prompt, imagesBase64: [imageBase64])],
+                temperature: 0.2, maxTokens: 160, onText: { _ in }) else { continue }
+            samples.record(result)
+            let pointing = PointingTagParser.parse(from: result.text)
+            if pointing.hasPoint, let center = pointing.centerInImagePixels {
+                parsed += 1
+                if center.x >= 0, center.x <= CGFloat(width), center.y >= 0, center.y <= CGFloat(height) {
+                    inBounds += 1
+                }
+            }
+        }
+    }
+    let denom = Double(max(attempts, 1))
+    return BenchRunResult(model: model, role: "vision", samples: samples.total.count,
+                          meanFirstTokenSeconds: samples.meanFirstToken,
+                          meanTotalSeconds: samples.meanTotal,
+                          meanTokensPerSecond: samples.meanTokensPerSecond,
+                          pointParseRate: Double(parsed) / denom,
+                          pointInBoundsRate: Double(inBounds) / denom)
+}
+
+/// Structured before/after benchmark. Measures the text model plus every
+/// installed vision candidate (so qwen2.5vl and moondream can be compared
+/// head-to-head), then writes a JSON + Markdown report under docs/benchmarks/.
+///   localbrain-harness --benchmark-suite <image.png> [iterations] [label]
+func runBenchmarkSuite(imagePath: String, iterations: Int, label: String) async {
+    let client = OllamaClient()
+    print("=== LocalClicky benchmark suite — \(label) (\(iterations)x each prompt) ===")
+    guard await client.isServerReachable() else {
+        print("❌ Ollama not reachable on \(client.baseURL). Start it: ollama serve"); exit(1)
+    }
+    guard let rawData = FileManager.default.contents(atPath: imagePath) else {
+        print("❌ couldn't read image at \(imagePath)"); exit(1)
+    }
+    // Prefer the PNG header; fall back to a JPEG decode for size.
+    var (width, height) = pngPixelSize(path: imagePath) ?? (0, 0)
+    if width == 0 || height == 0 {
+        if let resized = resizedJPEG(from: rawData, longEdge: 4096, compression: 1.0) { (width, height) = (resized.width, resized.height) }
+    }
+    let imageBase64 = rawData.base64EncodedString()
+
+    let textPrompts = [
+        "what's 12 times 8? answer in one short sentence.",
+        "explain what git is, in two short sentences.",
+        "what's the capital of france?",
+    ]
+    let pointPrompts = [
+        "where do i click to open settings?",
+        "point at the search bar.",
+        "where is the close button?",
+        "show me where to type.",
+    ]
+
+    var results: [BenchRunResult] = []
+
+    print("\n--- text model: \(LocalModels.chatModel) ---")
+    let textResult = await benchTextModel(client, model: LocalModels.chatModel, prompts: textPrompts, iterations: iterations)
+    results.append(textResult)
+    print(String(format: "  TTFT %.2fs | total %.2fs | %.0f tok/s",
+                 textResult.meanFirstTokenSeconds, textResult.meanTotalSeconds, textResult.meanTokensPerSecond))
+
+    // Every installed vision candidate, so the swap can be judged on real numbers.
+    let installed = (try? await client.listInstalledModels())?.map { $0.name } ?? []
+    var visionCandidates: [String] = []
+    for candidate in ["qwen2.5vl:3b", "moondream", "qwen3-vl:8b"] where OllamaClient.modelInstalled(candidate, among: installed) {
+        // Normalize moondream → the actual installed tag so the request matches.
+        let resolved = installed.first { OllamaClient.modelInstalled(candidate, among: [$0]) } ?? candidate
+        if !visionCandidates.contains(resolved) { visionCandidates.append(resolved) }
+    }
+    for model in visionCandidates {
+        print("\n--- vision model: \(model) [\(width)x\(height)] ---")
+        let result = await benchVisionModel(client, model: model, imageBase64: imageBase64,
+                                            width: width, height: height, prompts: pointPrompts, iterations: iterations)
+        results.append(result)
+        print(String(format: "  TTFT %.2fs | total %.2fs | %.0f tok/s | point-parse %.0f%% | in-bounds %.0f%%",
+                     result.meanFirstTokenSeconds, result.meanTotalSeconds, result.meanTokensPerSecond,
+                     result.pointParseRate * 100, result.pointInBoundsRate * 100))
+    }
+
+    // Provenance + write the report.
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let report = BenchSuiteReport(
+        label: label, timestamp: stamp,
+        gitCommit: shellCapture("git", ["rev-parse", "--short", "HEAD"]),
+        image: imagePath, imageWidth: width, imageHeight: height, iterations: iterations,
+        textModel: LocalModels.chatModel, visionModel: LocalModels.visionModel,
+        ollamaPs: shellCapture("ollama", ["ps"]), results: results)
+
+    let dateOnly = String(stamp.prefix(10))
+    let outDir = "docs/benchmarks"
+    try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+    let jsonPath = "\(outDir)/\(label)-\(dateOnly).json"
+    let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    if let data = try? encoder.encode(report) { try? data.write(to: URL(fileURLWithPath: jsonPath)) }
+
+    // Human-readable Markdown alongside the JSON.
+    var md = "# LocalClicky benchmark — \(label)\n\n"
+    md += "- Date: \(stamp)\n- Commit: \(report.gitCommit)\n- Image: \(imagePath) (\(width)x\(height))\n- Iterations per prompt: \(iterations)\n\n"
+    md += "| Model | Role | TTFT (s) | Total (s) | tok/s | Point-parse | In-bounds |\n"
+    md += "|---|---|---:|---:|---:|---:|---:|\n"
+    for r in results {
+        let pp = r.role == "vision" ? String(format: "%.0f%%", r.pointParseRate * 100) : "—"
+        let ib = r.role == "vision" ? String(format: "%.0f%%", r.pointInBoundsRate * 100) : "—"
+        md += String(format: "| %@ | %@ | %.2f | %.2f | %.0f | %@ | %@ |\n",
+                     r.model, r.role, r.meanFirstTokenSeconds, r.meanTotalSeconds, r.meanTokensPerSecond, pp, ib)
+    }
+    md += "\n```\nollama ps:\n\(report.ollamaPs)\n```\n"
+    let mdPath = "\(outDir)/\(label)-\(dateOnly).md"
+    try? md.write(toFile: mdPath, atomically: true, encoding: .utf8)
+
+    print("\n📊 wrote \(jsonPath)\n📊 wrote \(mdPath)")
+}
+
 /// Dependency-free assertion runner so the pointing-tag parser can be verified
 /// on a Command-Line-Tools-only machine (XCTest needs full Xcode).
 func runSelfTest() -> Never {
@@ -410,6 +611,15 @@ func runHarness() async {
         let benchImage = arguments.count >= 2 ? arguments[1] : nil
         let iterations = arguments.count >= 3 ? (Int(arguments[2]) ?? 3) : 3
         await runBenchmark(imagePath: benchImage, iterations: iterations)
+        return
+    }
+    if arguments.first == "--benchmark-suite" {
+        guard arguments.count >= 2 else {
+            print("usage: localbrain-harness --benchmark-suite <image.png> [iterations] [label]"); exit(1)
+        }
+        let iterations = arguments.count >= 3 ? (Int(arguments[2]) ?? 3) : 3
+        let label = arguments.count >= 4 ? arguments[3] : "baseline"
+        await runBenchmarkSuite(imagePath: arguments[1], iterations: iterations, label: label)
         return
     }
     let imagePath = arguments.first

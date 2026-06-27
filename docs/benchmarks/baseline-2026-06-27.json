@@ -1,0 +1,54 @@
+{
+  "gitCommit" : "eca2e16",
+  "image" : "scratch\/baseline-shot.png",
+  "imageHeight" : 1080,
+  "imageWidth" : 1920,
+  "iterations" : 2,
+  "label" : "baseline",
+  "ollamaPs" : "NAME           ID              SIZE      PROCESSOR    CONTEXT    UNTIL              \nqwen3-vl:8b    901cae732162    6.4 GB    100% GPU     8192       9 minutes from now",
+  "results" : [
+    {
+      "meanFirstTokenSeconds" : 0.4527295033137004,
+      "meanTokensPerSecond" : 44.38253947994252,
+      "meanTotalSeconds" : 1.0388666987419128,
+      "model" : "llama3.2:3b",
+      "pointInBoundsRate" : 0,
+      "pointParseRate" : 0,
+      "role" : "text",
+      "samples" : 6
+    },
+    {
+      "meanFirstTokenSeconds" : 0.21955762803554535,
+      "meanTokensPerSecond" : 38.88858578615773,
+      "meanTotalSeconds" : 1.201980009675026,
+      "model" : "qwen2.5vl:3b",
+      "pointInBoundsRate" : 0.5,
+      "pointParseRate" : 0.5,
+      "role" : "vision",
+      "samples" : 8
+    },
+    {
+      "meanFirstTokenSeconds" : 0.5787795186042786,
+      "meanTokensPerSecond" : 750016.1509565419,
+      "meanTotalSeconds" : 0.4775376170873642,
+      "model" : "moondream:latest",
+      "pointInBoundsRate" : 0,
+      "pointParseRate" : 0,
+      "role" : "vision",
+      "samples" : 8
+    },
+    {
+      "meanFirstTokenSeconds" : 0,
+      "meanTokensPerSecond" : 16.45563166108761,
+      "meanTotalSeconds" : 10.044187009334564,
+      "model" : "qwen3-vl:8b",
+      "pointInBoundsRate" : 0,
+      "pointParseRate" : 0,
+      "role" : "vision",
+      "samples" : 8
+    }
+  ],
+  "textModel" : "llama3.2:3b",
+  "timestamp" : "2026-06-27T07:23:31Z",
+  "visionModel" : "qwen2.5vl:3b"
+}
