@@ -536,6 +536,24 @@ func runSelfTest() -> Never {
           route("copy what you just said", ctx()) == .copyLastAnswer)
     check("plain 'copy this file' is NOT clipboard route",
           route("how do i copy this file", ctx()) != .copyLastAnswer)
+
+    // --- "give text" (blue side-text answers) ---
+    check("'give me X in text' → showText",
+          route("give me martin luther king's birthday in text", ctx()) == .showText)
+    check("'give text' → showText", route("give text", ctx()) == .showText)
+    check("'show me the text' → showText", route("show me the text for that", ctx()) == .showText)
+    check("'give me pi in text' works in text mode too",
+          route("give me pi in text", ctx(vision: false)) == .showText)
+    check("plain question is NOT showText", route("what's the capital of france", ctx()) == .text)
+
+    // --- Prompt integrity (describe vs point vs honest concise) ---
+    check("conciseText forbids made-up facts", LocalPrompts.conciseText.contains("never make up"))
+    check("screenDescribe has NO pointing instruction",
+          !LocalPrompts.screenDescribe(imageWidthInPixels: 100, imageHeightInPixels: 100).contains("[POINT"))
+    check("screenVoiceResponse keeps pointing instruction",
+          LocalPrompts.screenVoiceResponse(imageWidthInPixels: 100, imageHeightInPixels: 100).contains("[POINT"))
+    check("isLikelyGroundingCapable: moondream is not", !LocalModels.isLikelyGroundingCapable("moondream"))
+    check("isLikelyGroundingCapable: qwen2.5vl is", LocalModels.isLikelyGroundingCapable("qwen2.5vl:3b"))
     check("'open gmail' still → browserCommand", route("open gmail", ctx()) == .browserCommand)
     check("'open a new tab and go to gmail' still → browserCommand",
           route("open a new tab and go to gmail", ctx()) == .browserCommand)

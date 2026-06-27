@@ -80,12 +80,37 @@ public enum LocalPrompts {
     - you can help with anything — coding, writing, general knowledge, brainstorming, math.
     """
 
-    /// Onboarding-demo prompt: find one fun, specific, centrally-located thing on
-    /// screen to point at, with a short playful remark. Local replacement for the
-    /// cloud onboarding demo.
-    public static func onboardingDemo(imageWidthInPixels: Int, imageHeightInPixels: Int) -> String {
-        """
-        you're localclicky, a small blue cursor buddy that runs entirely on this mac. look at this \(imageWidthInPixels)x\(imageHeightInPixels) screenshot and pick ONE specific, clearly-named thing near the center of the screen to point at — an app icon, a word, a button, a filename. say a short playful 3-6 word remark about it, then append the tag [POINT:x,y:label] with the center pixel coordinates. only pick something between 20% and 80% of the width and height — nothing near the edges. all lowercase. respond with only your remark and the tag.
-        """
-    }
+    /// The first-run, screen-aware joke uses a **two-step** pipeline because the
+    /// small describe model (Moondream) reliably handles only simple, imperative
+    /// instructions — a complex "make a joke" prompt makes it return empty/garbage
+    /// (measured). So step 1 is a plain glance (below) on the vision model, and
+    /// step 2 (`screenJokeFromDescription`) turns that description into a joke on
+    /// the wittier text model.
+    ///
+    /// Step 1 — the vision model's quick screen glance. Imperative + an assistant
+    /// system prompt; question-form prompts make Moondream return empty.
+    public static let screenGlanceSystem =
+        "you are a helpful assistant that looks at a screenshot and says, in one short sentence, what app or website it is and what the person is doing."
+    public static let screenGlanceUser = "describe what's on this screen."
+
+    /// Step 2 — turn a plain screen description into ONE funny, lightly edgy
+    /// one-liner, on the text model (far wittier than the small vision model).
+    public static let screenJokeFromDescription = """
+    \(identity)
+
+    the user just opened localclicky for the first time. based on a short description of what's on their screen, make ONE genuinely funny, slightly cheeky one-liner about what they're doing. it must clearly riff on what they're actually doing so the joke lands. one sentence, all lowercase, playful and a little edgy but never mean, offensive, or personal. reply with only the joke — no preamble, no quotes, no emojis.
+    """
+
+    /// "give me X in text" / "give text" command. The answer is shown in the blue
+    /// side-text bubble (and spoken), so it must be tight — but confident on
+    /// well-known facts, and never invented when unsure.
+    public static let conciseText = """
+    \(identity)
+
+    the user asked you to give them something *in text*. reply with ONLY the answer and nothing else — no preamble, no "sure", no "here you go", no markdown, no quotes. keep it to a single short line.
+
+    be direct and confident about well-known facts, and include the year for dates. do not hedge on common knowledge. only if you genuinely don't know should you say you're not sure — and never make up a specific date, name, or number you're unsure of.
+
+    example: "when was martin luther king's birthday, in text" -> "january 15, 1929"
+    """
 }

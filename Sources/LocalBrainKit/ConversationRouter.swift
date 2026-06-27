@@ -40,6 +40,9 @@ public enum ConversationRoute: Equatable, Sendable {
     /// Copy the companion's last spoken answer to the clipboard ("copy your
     /// answer", "put that on my clipboard").
     case copyLastAnswer
+    /// Show a concise, honest answer in the blue side-text beside the cursor
+    /// ("give me X in text", "give text", "show me the text").
+    case showText
 }
 
 public enum ConversationRouter {
@@ -75,6 +78,8 @@ public enum ConversationRouter {
         //    unambiguous they are:
         //    a) "copy your answer to the clipboard" — refers to what we just said.
         if wantsCopyLastAnswer(text) { return .copyLastAnswer }
+        //    a2) "give me X in text" / "give text" — answer in the blue side-text.
+        if wantsShowText(text) { return .showText }
         //    b) "launch spotify" / "open the notes app" — open an installed app.
         //       Checked before the browser so explicit app phrasing isn't read as
         //       a website (e.g. "launch spotify" opens the app, not spotify.com).
@@ -144,6 +149,20 @@ public enum ConversationRouter {
             "copy what you said", "copy what you just said", "copy that down",
         ]
         return answerPhrases.contains(where: text.contains)
+    }
+
+    // MARK: - "Give text" (answer in the blue side-text)
+
+    /// True when the user wants the answer shown as text beside the cursor rather
+    /// than (only) spoken: "give me X in text", "give text", "show me the text".
+    static func wantsShowText(_ text: String) -> Bool {
+        if text == "give text" || text.hasPrefix("give text ") || text.hasPrefix("give me text") { return true }
+        let phrases = [
+            " in text", " as text", " in writing", " on text",
+            "show me the text", "show it in text", "put it in text", "type it out",
+            "write it out", "give me the text", "text it to me", "text me the",
+        ]
+        return phrases.contains(where: text.contains)
     }
 
     // MARK: - Browser commands

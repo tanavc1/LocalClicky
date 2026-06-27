@@ -186,9 +186,7 @@ final class CompanionManager: ObservableObject {
         transientHideTask = nil
 
         if enabled {
-            overlayWindowManager.hasShownOverlayBefore = true
-            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-            isOverlayVisible = true
+            presentOverlayAndIntroIfNeeded()
         } else {
             overlayWindowManager.hideOverlay()
             isOverlayVisible = false
@@ -219,12 +217,25 @@ final class CompanionManager: ObservableObject {
         warmUpLocalModels()
         refreshInstalledModels()
 
-        // Permissions granted → show the cursor now. (The first-run intro +
-        // screen-aware joke play via the blue side-text channel — see Phase 3.)
+        // Permissions granted → show the cursor now (and, on first launch, play
+        // the intro + screen-aware joke in the blue side-text beside the cursor).
         if allPermissionsGranted && isClickyCursorEnabled {
-            overlayWindowManager.hasShownOverlayBefore = true
-            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-            isOverlayVisible = true
+            presentOverlayAndIntroIfNeeded()
+        }
+    }
+
+    /// Shows the cursor overlay and, the very first time, kicks off the blue-text
+    /// intro + screen-aware joke. Kept in one place so every path that first
+    /// reveals the cursor (launch, cursor toggle, permission grant) plays the
+    /// intro exactly once.
+    private func presentOverlayAndIntroIfNeeded() {
+        overlayWindowManager.hasShownOverlayBefore = true
+        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+        isOverlayVisible = true
+        guard !hasSeenIntro else { return }
+        // Small delay so the cursor has faded in before the intro starts typing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.playFirstRunIntro()
         }
     }
 
@@ -454,9 +465,7 @@ final class CompanionManager: ObservableObject {
                 print("✅ Screen content auto-confirmed (Screen Recording is granted).")
                 if self.allPermissionsGranted
                     && !self.isOverlayVisible && self.isClickyCursorEnabled {
-                    self.overlayWindowManager.hasShownOverlayBefore = true
-                    self.overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-                    self.isOverlayVisible = true
+                    self.presentOverlayAndIntroIfNeeded()
                 }
             }
         }
@@ -487,9 +496,7 @@ final class CompanionManager: ObservableObject {
                     hasScreenContentPermission = true
                     UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
                     if allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
-                        overlayWindowManager.hasShownOverlayBefore = true
-                        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-                        isOverlayVisible = true
+                        presentOverlayAndIntroIfNeeded()
                     }
                 }
             } catch {
@@ -643,6 +650,11 @@ final class CompanionManager: ObservableObject {
                 }
                 if route == .copyLastAnswer {
                     await handleCopyLastAnswer()
+                    settleAfterAction()
+                    return
+                }
+                if route == .showText {
+                    await handleShowTextCommand(transcript: transcript)
                     settleAfterAction()
                     return
                 }
@@ -886,6 +898,113 @@ final class CompanionManager: ObservableObject {
         voiceState = .responding
         do { try await speechSynthesizer.speakText(summary) }
         catch { print("⚠️ TTS error during clipboard command: \(error)") }
+    }
+
+    /// Answers a "give me X in text" command: a concise, honest answer rendered
+    /// in the blue side-text beside the cursor (and spoken). Uses the fast text
+    /// model; the conciseText prompt forces brevity and forbids made-up facts.
+    private func handleShowTextCommand(transcript: String) async {
+        voiceState = .processing
+        var answer = ""
+        do {
+            let result = try await ollamaClient.streamChat(
+                model: chatModelName,
+                messages: [.system(LocalPrompts.conciseText), .user(transcript)],
+                temperature: 0.2,
+                maxTokens: 64,
+                contextWindow: LocalModels.defaultContextWindow,
+                onText: { _ in })
+            answer = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch is CancellationError {
+            return
+        } catch {
+            print("⚠️ give-text error: \(error)")
+            refreshLocalEngineStatus()
+        }
+
+        conversationHistory.append((userTranscript: transcript, assistantResponse: answer))
+        if conversationHistory.count > 10 { conversationHistory.removeFirst(conversationHistory.count - 10) }
+        previousTurnUsedScreen = false
+
+        guard !answer.isEmpty else {
+            streamSideText("hmm, i couldn't get that one. try asking again.", holdSeconds: 5, autoDismiss: true)
+            return
+        }
+        lastSpokenAnswer = answer
+        // Blue text is the primary output for this command; also speak it since
+        // LocalClicky is voice-first.
+        streamSideText(answer, characterInterval: 0.02, holdSeconds: 10, autoDismiss: true)
+        voiceState = .responding
+        do { try await speechSynthesizer.speakText(answer) }
+        catch { print("⚠️ TTS error during give-text: \(error)") }
+    }
+
+    // MARK: - First-run intro (blue side-text) + screen-aware joke
+
+    /// First launch only: streams a short self-intro in the blue side-text while,
+    /// in parallel, grabbing the screen; when the intro finishes, drops a
+    /// screen-aware joke into the same blue text (and speaks it).
+    func playFirstRunIntro() {
+        // Capture + joke generation start immediately, in parallel with the intro
+        // streaming — so the joke is usually ready by the time the intro ends.
+        let jokeTask = Task<String?, Never> { [weak self] in
+            guard let self else { return nil }
+            return await self.generateScreenJoke()
+        }
+
+        let intro = "hey, i'm localclicky — your on-device mac buddy. hold control and option to talk to me, and i'll answer out loud and fly my blue cursor to things on your screen. everything runs locally on your mac, no cloud. one sec, let me see what you're up to…"
+        streamSideText(intro, characterInterval: 0.026, autoDismiss: false) { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                let joke = await jokeTask.value
+                // If the user already started talking (side text cleared), don't barge in.
+                guard self.companionSideText != nil else { return }
+                if let joke, !joke.isEmpty {
+                    self.streamSideText(joke, characterInterval: 0.03, holdSeconds: 9, autoDismiss: true)
+                    self.voiceState = .responding
+                    do { try await self.speechSynthesizer.speakText(joke) }
+                    catch { /* a missing voice shouldn't break the intro */ }
+                    self.voiceState = .idle
+                } else {
+                    self.dismissSideText()
+                }
+            }
+        }
+    }
+
+    /// Captures the screen and produces a one-line, screen-aware joke via a
+    /// two-step pipeline: the vision model glances (a simple describe it can
+    /// actually do), then the wittier text model turns that into the joke.
+    /// Returns nil if the screen isn't available or both steps fail.
+    private func generateScreenJoke() async -> String? {
+        guard hasScreenContentPermission else { return nil }
+        guard let capture = try? await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG() else { return nil }
+
+        // Step 1 — vision model glance (simple imperative; reliable on Moondream).
+        let glance = try? await ollamaClient.streamChat(
+            model: visionModelName,
+            messages: [.system(LocalPrompts.screenGlanceSystem),
+                       .user(LocalPrompts.screenGlanceUser,
+                             imagesBase64: [capture.imageData.base64EncodedString()])],
+            temperature: 0.3,
+            maxTokens: 60,
+            contextWindow: LocalModels.defaultContextWindow,
+            onText: { _ in })
+        var description = glance?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The small vision model occasionally returns empty/garbage; fall back to
+        // a generic-but-still-screen-aware description so the joke still lands.
+        if description.count < 8 { description = "their computer screen with a few things open" }
+
+        // Step 2 — text model turns the description into a witty one-liner.
+        let joke = try? await ollamaClient.streamChat(
+            model: chatModelName,
+            messages: [.system(LocalPrompts.screenJokeFromDescription),
+                       .user("the user is looking at: \(description). make the joke.")],
+            temperature: 0.9,
+            maxTokens: 50,
+            contextWindow: LocalModels.defaultContextWindow,
+            onText: { _ in })
+        return joke?.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Converts a point in the screenshot's pixel space (top-left origin) to a
