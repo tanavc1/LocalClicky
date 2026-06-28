@@ -29,9 +29,31 @@ P12_PASSWORD="localclicky"   # local-only; the key never leaves this Mac.
 
 log() { echo "$@" >&2; }
 
-# The login keychain (where codesign looks by default). `default-keychain`
-# prints it quoted; strip the quotes and surrounding whitespace.
-KEYCHAIN="$(security default-keychain -d user | sed -E 's/^[[:space:]]*"?//; s/"?[[:space:]]*$//')"
+# Use a dedicated local keychain instead of the login keychain. That keeps the
+# signing key non-interactive for scripts/build-app.sh while still giving TCC a
+# stable certificate-anchored Designated Requirement across rebuilds.
+KEYCHAIN_PASSWORD="localclicky-signing"
+KEYCHAIN="$HOME/Library/Keychains/LocalClickySigning.keychain-db"
+
+ensure_keychain() {
+  if [ ! -f "$KEYCHAIN" ]; then
+    log "==> Creating local signing keychain."
+    security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1
+  fi
+
+  security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1 || true
+  security set-keychain-settings -lut 21600 "$KEYCHAIN" >/dev/null 2>&1 || true
+
+  # Add the keychain to the user search list exactly once so codesign can find
+  # the identity by hash without prompting.
+  CURRENT_KEYCHAINS="$(security list-keychains -d user | tr -d '"' | sed -E 's/^[[:space:]]+//')"
+  if ! printf '%s\n' "$CURRENT_KEYCHAINS" | grep -Fxq "$KEYCHAIN"; then
+    # shellcheck disable=SC2086
+    security list-keychains -d user -s "$KEYCHAIN" $CURRENT_KEYCHAINS >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_keychain
 
 # Returns the 40-hex SHA-1 of our identity if it already exists, else nothing.
 existing_identity_hash() {
@@ -43,6 +65,8 @@ existing_identity_hash() {
 
 HASH="$(existing_identity_hash || true)"
 if [ -n "$HASH" ]; then
+  security set-key-partition-list -S apple-tool:,apple:,codesign: \
+    -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1 || true
   log "==> Reusing existing local signing identity ($HASH)."
   echo "$HASH"
   exit 0
@@ -70,13 +94,18 @@ openssl req -x509 -newkey rsa:2048 -keyout "$TMP/key.pem" -out "$TMP/cert.pem" \
   -days 3650 -nodes -config "$TMP/csign.cnf" >/dev/null 2>&1
 
 # Bundle into a PKCS#12 (a non-empty password avoids macOS's MAC-verify quirk).
-openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
+openssl pkcs12 -legacy -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
   -out "$TMP/identity.p12" -name "$IDENTITY_NAME" -passout pass:"$P12_PASSWORD" >/dev/null 2>&1
 
-# Import into the login keychain. `-A` lets codesign use the private key without
-# popping a keychain-access prompt on every build.
+# Import into the local signing keychain. `-A` plus the partition list below lets
+# codesign use the private key without prompting on every build.
 security import "$TMP/identity.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" \
   -A -T /usr/bin/codesign -T /usr/bin/security >/dev/null 2>&1
+
+# Let non-interactive build scripts use the private key. Without this, macOS can
+# show a hidden keychain prompt and leave `codesign` stuck forever.
+security set-key-partition-list -S apple-tool:,apple:,codesign: \
+  -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null 2>&1 || true
 
 HASH="$(existing_identity_hash || true)"
 if [ -z "$HASH" ]; then

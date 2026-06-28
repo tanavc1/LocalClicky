@@ -60,10 +60,12 @@ echo "==> 4/6  Building a fresh, stably-signed app…"
 
 echo "==> 5/6  Installing to /Applications…"
 [ -d "$BUILT" ] || { echo "build did not produce $BUILT"; exit 1; }
+rm -rf "$INSTALLED"
 ditto "$BUILT" "$INSTALLED"
 # This is a local build, not a download — strip any quarantine/provenance xattrs
 # so macOS opens it with a plain double-click (no right-click → Open dance).
 xattr -cr "$INSTALLED" 2>/dev/null || true
+rm -rf "$BUILT"
 
 echo "==> 6/6  Launching LocalClicky…"
 open "$INSTALLED"

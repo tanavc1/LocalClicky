@@ -24,10 +24,28 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 APP_NAME="LocalClicky"
+BUNDLE_ID="com.localclicky.LocalClicky"
 INSTALLED="/Applications/$APP_NAME.app"
 BUILT="$ROOT/dist/$APP_NAME.app"
+DID_RESET_TCC_FOR_SIGNING_CHANGE=0
 
-echo "==> 1/5  Quitting $APP_NAME and ejecting stale disk images…"
+designated_certificate_hash() {
+  local app="$1"
+  [ -d "$app" ] || return 0
+  codesign -d -r- "$app" 2>&1 \
+    | sed -n 's/.*certificate leaf = H"\([^"]*\)".*/\1/p' \
+    | tr '[:upper:]' '[:lower:]'
+}
+
+reset_tcc_records_for_signing_change() {
+  echo "    signing identity changed; clearing stale TCC records for $BUNDLE_ID"
+  for svc in Accessibility ScreenCapture ListenEvent Microphone Camera All; do
+    tccutil reset "$svc" "$BUNDLE_ID" >/dev/null 2>&1 || true
+  done
+  DID_RESET_TCC_FOR_SIGNING_CHANGE=1
+}
+
+echo "==> 1/5  Quitting ${APP_NAME} and ejecting stale disk images…"
 osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || true
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 sleep 1
@@ -37,10 +55,16 @@ for vol in /Volumes/"$APP_NAME"*; do
 done
 
 echo "==> 2/5  Building a fresh, stably-signed app…"
-echo "    (if a keychain prompt appears for \"LocalClicky Local Signing\", click"
-echo "     Always Allow — this is the local signing key, it never leaves your Mac.)"
+echo "    using the local signing key; it never leaves your Mac."
 "$ROOT/scripts/build-app.sh"
 [ -d "$BUILT" ] || { echo "build did not produce $BUILT"; exit 1; }
+
+INSTALLED_SIGNING_HASH="$(designated_certificate_hash "$INSTALLED" || true)"
+BUILT_SIGNING_HASH="$(designated_certificate_hash "$BUILT" || true)"
+if [ -n "$INSTALLED_SIGNING_HASH" ] && [ -n "$BUILT_SIGNING_HASH" ] \
+   && [ "$INSTALLED_SIGNING_HASH" != "$BUILT_SIGNING_HASH" ]; then
+  reset_tcc_records_for_signing_change
+fi
 
 echo "==> 3/5  Removing old copies of the app…"
 for p in "$HOME/Downloads/$APP_NAME.app" "$HOME/Desktop/$APP_NAME.app" \
@@ -49,13 +73,20 @@ for p in "$HOME/Downloads/$APP_NAME.app" "$HOME/Desktop/$APP_NAME.app" \
 done
 
 echo "==> 4/5  Installing to /Applications (keeping your permissions)…"
+rm -rf "$INSTALLED"
 ditto "$BUILT" "$INSTALLED"
 xattr -cr "$INSTALLED" 2>/dev/null || true
+rm -rf "$BUILT"
 
-echo "==> 5/5  Launching $APP_NAME…"
+echo "==> 5/5  Launching ${APP_NAME}…"
 open "$INSTALLED"
 
 echo ""
 echo "  ✅ Updated: $INSTALLED"
 echo "  LocalClicky is in the menu bar (top-right). Your existing permissions"
-echo "  carry over because the app keeps the same stable signing identity."
+if [ "$DID_RESET_TCC_FOR_SIGNING_CHANGE" = "1" ]; then
+  echo "  were reset once because the signing identity changed. Re-grant the"
+  echo "  prompts shown by LocalClicky; future updates will keep those grants."
+else
+  echo "  carry over because the app keeps the same stable signing identity."
+fi
