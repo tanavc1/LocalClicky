@@ -33,6 +33,8 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private let companionManager = CompanionManager()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard relaunchInstalledCopyIfNeeded() == false else { return }
+
         print("🔵 LocalClicky: Starting...")
         print("🔵 LocalClicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
 
@@ -48,6 +50,26 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
             menuBarPanelManager?.showPanelOnLaunch()
         }
         registerAsLoginItemIfNeeded()
+    }
+
+    /// TCC grants are tied to the exact signed app identity macOS is running.
+    /// If a user launches LocalClicky from a DMG or another duplicate app bundle,
+    /// System Settings can show Accessibility for that copy while the installed
+    /// app still sees the grant as denied. Always hand off to the installed app.
+    private func relaunchInstalledCopyIfNeeded() -> Bool {
+        let installedAppURL = URL(fileURLWithPath: "/Applications/LocalClicky.app")
+        let currentAppURL = Bundle.main.bundleURL.standardizedFileURL
+        let isRunningFromAppBundle = currentAppURL.pathExtension == "app"
+        let isInstalledCopy = currentAppURL.path == installedAppURL.standardizedFileURL.path
+
+        guard isRunningFromAppBundle, !isInstalledCopy, FileManager.default.fileExists(atPath: installedAppURL.path) else {
+            return false
+        }
+
+        print("⚠️ LocalClicky: launched from \(currentAppURL.path); relaunching installed app.")
+        NSWorkspace.shared.open(installedAppURL)
+        NSApp.terminate(nil)
+        return true
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
