@@ -74,18 +74,26 @@ ENT="$ROOT/Sources/LocalClicky/Resources/LocalClicky.entitlements"
 #   3. ADHOC=1 forces the old ad-hoc behavior.
 if [ "${ADHOC:-0}" = "1" ]; then
   IDENTITY="-"
+  CODESIGN_KEYCHAIN_ARGS=()
 elif [ -n "${CODESIGN_IDENTITY:-}" ]; then
   IDENTITY="$CODESIGN_IDENTITY"
+  CODESIGN_KEYCHAIN_ARGS=()
 else
   IDENTITY="$("$ROOT/scripts/ensure-signing-identity.sh")"
+  LOCAL_SIGNING_KEYCHAIN="$HOME/Library/Keychains/LocalClickySigning.keychain-db"
+  if [ -f "$LOCAL_SIGNING_KEYCHAIN" ]; then
+    CODESIGN_KEYCHAIN_ARGS=(--keychain "$LOCAL_SIGNING_KEYCHAIN")
+  else
+    CODESIGN_KEYCHAIN_ARGS=()
+  fi
 fi
 echo "    signing identity: $IDENTITY"
 # Sign the bundled dylibs first (inside-out), so the app signature is valid.
 if [ -d "$SHERPA_DST/lib" ]; then
-  codesign --force --sign "$IDENTITY" "$SHERPA_DST/lib/libonnxruntime.1.24.4.dylib"
-  codesign --force --sign "$IDENTITY" "$SHERPA_DST/lib/libsherpa-onnx-c-api.dylib"
+  codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$IDENTITY" "$SHERPA_DST/lib/libonnxruntime.1.24.4.dylib"
+  codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$IDENTITY" "$SHERPA_DST/lib/libsherpa-onnx-c-api.dylib"
 fi
-codesign --force --deep --entitlements "$ENT" --sign "$IDENTITY" "$APP"
+codesign --force --deep "${CODESIGN_KEYCHAIN_ARGS[@]}" --entitlements "$ENT" --sign "$IDENTITY" "$APP"
 codesign --verify --verbose "$APP" 2>&1 | tail -1 || true
 # Show the Designated Requirement so it's obvious the identity is cert-anchored
 # (stable) rather than cdhash-pinned (resets permissions on every rebuild).

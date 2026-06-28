@@ -209,7 +209,7 @@ struct CompanionPanelView: View {
                     Button(action: {
                         // Triggers the system accessibility prompt (AXIsProcessTrustedWithOptions)
                         // on first attempt, then opens System Settings on subsequent attempts.
-                        WindowPositionManager.requestAccessibilityPermission()
+                        companionManager.requestAccessibilityPermission()
                     }) {
                         Text("Grant")
                             .font(.system(size: 11, weight: .semibold))

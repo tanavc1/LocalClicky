@@ -625,7 +625,14 @@ final class CompanionManager: ObservableObject {
         accessibilityCheckTimer = nil
     }
 
+    func requestAccessibilityPermission() {
+        WindowPositionManager.requestAccessibilityPermission()
+        refreshAllPermissions()
+        schedulePermissionRefreshesAfterAccessibilityRequest()
+    }
+
     func refreshAllPermissions() {
+        let hadAllPermissionsBeforeRefresh = allPermissionsGranted
         let currentlyHasAccessibility = WindowPositionManager.hasAccessibilityPermission()
         hasAccessibilityPermission = currentlyHasAccessibility
 
@@ -660,6 +667,21 @@ final class CompanionManager: ObservableObject {
             // doesn't show "Granted" for a permission the running app no longer has.
             hasScreenContentPermission = false
             UserDefaults.standard.set(false, forKey: "hasScreenContentPermission")
+        }
+
+        if !hadAllPermissionsBeforeRefresh
+            && allPermissionsGranted
+            && !isOverlayVisible
+            && isClickyCursorEnabled {
+            presentOverlayAndIntroIfNeeded()
+        }
+    }
+
+    private func schedulePermissionRefreshesAfterAccessibilityRequest() {
+        for delay in [0.4, 1.5, 3.0, 6.0, 10.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.refreshAllPermissions()
+            }
         }
     }
 

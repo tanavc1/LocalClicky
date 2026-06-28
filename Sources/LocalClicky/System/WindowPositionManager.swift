@@ -33,7 +33,8 @@ class WindowPositionManager {
 
     /// Returns true if the app has Accessibility permission.
     static func hasAccessibilityPermission() -> Bool {
-        AXIsProcessTrusted()
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
     }
 
     /// Presents exactly one permission path per tap: the system prompt on the first

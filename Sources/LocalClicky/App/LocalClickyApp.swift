@@ -50,6 +50,10 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         registerAsLoginItemIfNeeded()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        companionManager.refreshAllPermissions()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         companionManager.stop()
     }
