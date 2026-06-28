@@ -42,6 +42,8 @@ reset_tcc_records_for_signing_change() {
   for svc in Accessibility ScreenCapture ListenEvent Microphone Camera All; do
     tccutil reset "$svc" "$BUNDLE_ID" >/dev/null 2>&1 || true
   done
+  defaults delete "$BUNDLE_ID" com.learningbuddy.hasPreviouslyConfirmedScreenRecordingPermission >/dev/null 2>&1 || true
+  defaults delete "$BUNDLE_ID" hasScreenContentPermission >/dev/null 2>&1 || true
   DID_RESET_TCC_FOR_SIGNING_CHANGE=1
 }
 

@@ -62,7 +62,7 @@ scripts/setup.sh
    **`/Applications/LocalClicky.app`**, and launches it.
 
 The app appears in your **menu bar** (top-right, no Dock icon). Click the icon,
-grant the four permissions it asks for, then hold **Control + Option** and talk.
+grant the three permissions it asks for, then hold **Control + Option** and talk.
 
 > **Permissions stick.** The build is signed with a persistent, locally-created
 > certificate (`scripts/ensure-signing-identity.sh`), so macOS keeps your
@@ -216,8 +216,7 @@ in the Models section restores the defaults.
 |---|---|
 | Microphone | hear your push-to-talk voice (transcribed on-device) |
 | Accessibility | detect the global Control+Option hotkey |
-| Screen Recording | screenshot your screen for the vision model |
-| Screen Content | ScreenCaptureKit capture |
+| Screen Recording | screenshot your screen for the vision model via ScreenCaptureKit |
 
 ## Architecture
 

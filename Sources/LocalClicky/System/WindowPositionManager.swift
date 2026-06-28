@@ -103,6 +103,10 @@ class WindowPositionManager {
         hasScreenRecordingPermissionNow || hasPreviouslyConfirmedScreenRecordingPermission
     }
 
+    static func hasPreviouslyConfirmedScreenRecordingPermission() -> Bool {
+        UserDefaults.standard.bool(forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
+    }
+
     static func clearPreviouslyConfirmedScreenRecordingPermission() {
         UserDefaults.standard.removeObject(forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
     }

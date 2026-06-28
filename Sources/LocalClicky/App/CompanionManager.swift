@@ -37,7 +37,6 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var hasAccessibilityPermission = false
     @Published private(set) var hasScreenRecordingPermission = false
     @Published private(set) var hasMicrophonePermission = false
-    @Published private(set) var hasScreenContentPermission = false
 
     /// Screen location (global AppKit coords) of a detected UI element the buddy
     /// should fly to and point at. Parsed from the local model's response;
@@ -154,7 +153,7 @@ final class CompanionManager: ObservableObject {
 
     /// True when all required permissions are granted.
     var allPermissionsGranted: Bool {
-        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
+        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission
     }
 
     /// Whether the blue cursor overlay is currently visible on screen.
@@ -212,7 +211,7 @@ final class CompanionManager: ObservableObject {
 
     func start() {
         refreshAllPermissions()
-        print("🔑 LocalClicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), introSeen: \(hasSeenIntro)")
+        print("🔑 LocalClicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), introSeen: \(hasSeenIntro)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
@@ -631,8 +630,16 @@ final class CompanionManager: ObservableObject {
         schedulePermissionRefreshesAfterAccessibilityRequest()
     }
 
+    func requestScreenRecordingPermission() {
+        WindowPositionManager.requestScreenRecordingPermission()
+        refreshAllPermissions()
+        schedulePermissionRefreshesAfterScreenRecordingRequest()
+    }
+
     func refreshAllPermissions() {
         let hadAllPermissionsBeforeRefresh = allPermissionsGranted
+        UserDefaults.standard.removeObject(forKey: "hasScreenContentPermission")
+
         let currentlyHasAccessibility = WindowPositionManager.hasAccessibilityPermission()
         hasAccessibilityPermission = currentlyHasAccessibility
 
@@ -642,32 +649,15 @@ final class CompanionManager: ObservableObject {
             globalPushToTalkShortcutMonitor.stop()
         }
 
-        hasScreenRecordingPermission = WindowPositionManager.hasScreenRecordingPermission()
+        let currentlyHasScreenRecording = WindowPositionManager.hasScreenRecordingPermission()
+        let hadPreviouslyConfirmedScreenRecording = WindowPositionManager.hasPreviouslyConfirmedScreenRecordingPermission()
+        hasScreenRecordingPermission = currentlyHasScreenRecording || hadPreviouslyConfirmedScreenRecording
+        if !currentlyHasScreenRecording && hadPreviouslyConfirmedScreenRecording {
+            verifyPreviouslyConfirmedScreenRecordingStillWorks()
+        }
 
         let micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         hasMicrophonePermission = micAuthStatus == .authorized
-
-        // Screen content permission is persisted — once approved via the
-        // SCShareableContent picker, we don't re-check it.
-        if !hasScreenContentPermission {
-            hasScreenContentPermission = UserDefaults.standard.bool(forKey: "hasScreenContentPermission")
-        }
-
-        // "Screen Content" is really the same macOS permission as Screen
-        // Recording (ScreenCaptureKit just needs that grant). Requiring a
-        // separate manual click left users stuck with every System Settings
-        // toggle on but the app still saying "permissions needed." So once
-        // Screen Recording is granted, confirm screen content automatically.
-        if hasScreenRecordingPermission && !hasScreenContentPermission {
-            autoConfirmScreenContentIfPossible()
-        } else if !hasScreenRecordingPermission && hasScreenContentPermission {
-            // Screen Recording was revoked (or wiped by `tccutil reset` / a fresh
-            // reinstall). Since screen content rides on the same underlying TCC
-            // grant, a persisted "granted" flag is now stale — clear it so the UI
-            // doesn't show "Granted" for a permission the running app no longer has.
-            hasScreenContentPermission = false
-            UserDefaults.standard.set(false, forKey: "hasScreenContentPermission")
-        }
 
         if !hadAllPermissionsBeforeRefresh
             && allPermissionsGranted
@@ -685,62 +675,28 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    private var isAutoConfirmingScreenContent = false
-
-    /// Silently verifies ScreenCaptureKit access (no picker, no capture stored)
-    /// when Screen Recording is already granted, and flips the screen-content
-    /// gate so the app stops blocking. Runs at most one probe at a time.
-    private func autoConfirmScreenContentIfPossible() {
-        guard !isAutoConfirmingScreenContent else { return }
-        isAutoConfirmingScreenContent = true
-        Task {
-            let succeeded = (try? await SCShareableContent.excludingDesktopWindows(
-                false, onScreenWindowsOnly: true)) != nil
-            await MainActor.run {
-                self.isAutoConfirmingScreenContent = false
-                guard succeeded, !self.hasScreenContentPermission else { return }
-                self.hasScreenContentPermission = true
-                UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
-                print("✅ Screen content auto-confirmed (Screen Recording is granted).")
-                if self.allPermissionsGranted
-                    && !self.isOverlayVisible && self.isClickyCursorEnabled {
-                    self.presentOverlayAndIntroIfNeeded()
-                }
+    private func schedulePermissionRefreshesAfterScreenRecordingRequest() {
+        for delay in [0.6, 2.0, 5.0, 10.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.refreshAllPermissions()
             }
         }
     }
 
-    @Published private(set) var isRequestingScreenContent = false
+    private var isVerifyingPreviouslyConfirmedScreenRecording = false
 
-    /// Triggers the macOS screen content picker by performing a dummy capture.
-    func requestScreenContentPermission() {
-        guard !isRequestingScreenContent else { return }
-        isRequestingScreenContent = true
+    private func verifyPreviouslyConfirmedScreenRecordingStillWorks() {
+        guard !isVerifyingPreviouslyConfirmedScreenRecording else { return }
+        isVerifyingPreviouslyConfirmedScreenRecording = true
         Task {
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard let display = content.displays.first else {
-                    await MainActor.run { isRequestingScreenContent = false }
-                    return
-                }
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let config = SCStreamConfiguration()
-                config.width = 320
-                config.height = 240
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                let didCapture = image.width > 0 && image.height > 0
-                await MainActor.run {
-                    isRequestingScreenContent = false
-                    guard didCapture else { return }
-                    hasScreenContentPermission = true
-                    UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
-                    if allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
-                        presentOverlayAndIntroIfNeeded()
-                    }
-                }
-            } catch {
-                print("⚠️ Screen content permission request failed: \(error)")
-                await MainActor.run { isRequestingScreenContent = false }
+            let canReadScreenContent = (try? await SCShareableContent.excludingDesktopWindows(
+                false, onScreenWindowsOnly: true)) != nil
+            await MainActor.run {
+                self.isVerifyingPreviouslyConfirmedScreenRecording = false
+                guard !canReadScreenContent else { return }
+                WindowPositionManager.clearPreviouslyConfirmedScreenRecordingPermission()
+                self.hasScreenRecordingPermission = false
+                print("⚠️ Screen Recording fallback was stale; cleared saved confirmation.")
             }
         }
     }
@@ -868,7 +824,7 @@ final class CompanionManager: ObservableObject {
                     transcript: transcript,
                     context: ConversationRouter.Context(
                         visionModeSelected: !isTextOnlyMode,
-                        screenAvailable: hasScreenContentPermission,
+                        screenAvailable: hasScreenRecordingPermission,
                         previousTurnUsedScreen: previousTurnUsedScreen,
                         hasConversationHistory: !conversationHistory.isEmpty
                     )
@@ -1284,7 +1240,7 @@ final class CompanionManager: ObservableObject {
     /// actually do), then the wittier text model turns that into the joke.
     /// Returns nil if the screen isn't available or both steps fail.
     private func generateScreenJoke() async -> String? {
-        guard hasScreenContentPermission else { return nil }
+        guard hasScreenRecordingPermission else { return nil }
         guard let capture = try? await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG() else { return nil }
 
         // Step 1 — vision model glance (simple imperative; reliable on Moondream).
