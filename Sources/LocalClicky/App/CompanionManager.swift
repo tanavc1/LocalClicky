@@ -631,9 +631,15 @@ final class CompanionManager: ObservableObject {
     }
 
     func requestScreenRecordingPermission() {
-        WindowPositionManager.requestScreenRecordingPermission()
+        let destination = WindowPositionManager.requestScreenRecordingPermission()
+        if destination != .alreadyGranted {
+            markScreenRecordingGrantPendingFreshProcess()
+        }
         refreshAllPermissions()
         schedulePermissionRefreshesAfterScreenRecordingRequest()
+        if destination != .alreadyGranted {
+            scheduleAutomaticRelaunchAfterScreenRecordingGrant()
+        }
     }
 
     func refreshAllPermissions() {
@@ -652,6 +658,9 @@ final class CompanionManager: ObservableObject {
         let currentlyHasScreenRecording = WindowPositionManager.hasScreenRecordingPermission()
         let hadPreviouslyConfirmedScreenRecording = WindowPositionManager.hasPreviouslyConfirmedScreenRecordingPermission()
         hasScreenRecordingPermission = currentlyHasScreenRecording || hadPreviouslyConfirmedScreenRecording
+        if hasScreenRecordingPermission {
+            clearPendingScreenRecordingFreshProcess()
+        }
         if !currentlyHasScreenRecording && hadPreviouslyConfirmedScreenRecording {
             verifyPreviouslyConfirmedScreenRecordingStillWorks()
         }
@@ -665,6 +674,14 @@ final class CompanionManager: ObservableObject {
             && isClickyCursorEnabled {
             presentOverlayAndIntroIfNeeded()
         }
+    }
+
+    func refreshPermissionsAfterAppBecameActive() {
+        refreshAllPermissions()
+        guard UserDefaults.standard.bool(forKey: pendingScreenRecordingFreshProcessKey),
+              !hasScreenRecordingPermission else { return }
+        hasScheduledAutomaticScreenRecordingRelaunch = false
+        scheduleAutomaticRelaunchAfterScreenRecordingGrant()
     }
 
     private func schedulePermissionRefreshesAfterAccessibilityRequest() {
@@ -681,6 +698,57 @@ final class CompanionManager: ObservableObject {
                 self?.refreshAllPermissions()
             }
         }
+    }
+
+    private var hasScheduledAutomaticScreenRecordingRelaunch = false
+    private let pendingScreenRecordingFreshProcessKey = "pendingScreenRecordingFreshProcess"
+    private let pendingScreenRecordingFreshProcessAttemptsKey = "pendingScreenRecordingFreshProcessAttempts"
+
+    private func scheduleAutomaticRelaunchAfterScreenRecordingGrant() {
+        guard !hasScheduledAutomaticScreenRecordingRelaunch else { return }
+        hasScheduledAutomaticScreenRecordingRelaunch = true
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
+            self?.relaunchIfScreenRecordingGrantNeedsFreshProcess()
+        }
+    }
+
+    private func relaunchIfScreenRecordingGrantNeedsFreshProcess() {
+        refreshAllPermissions()
+        guard NSApp.isActive else {
+            hasScheduledAutomaticScreenRecordingRelaunch = false
+            return
+        }
+        guard UserDefaults.standard.bool(forKey: pendingScreenRecordingFreshProcessKey) else { return }
+        guard UserDefaults.standard.integer(forKey: pendingScreenRecordingFreshProcessAttemptsKey) < 1 else { return }
+        guard !hasScreenRecordingPermission, hasAccessibilityPermission, hasMicrophonePermission else { return }
+
+        print("🔁 Screen Recording still unavailable after grant flow; relaunching LocalClicky to refresh TCC.")
+        UserDefaults.standard.set(1, forKey: pendingScreenRecordingFreshProcessAttemptsKey)
+        relaunchInstalledAppAndTerminate()
+    }
+
+    private func markScreenRecordingGrantPendingFreshProcess() {
+        UserDefaults.standard.set(true, forKey: pendingScreenRecordingFreshProcessKey)
+        UserDefaults.standard.set(0, forKey: pendingScreenRecordingFreshProcessAttemptsKey)
+    }
+
+    private func clearPendingScreenRecordingFreshProcess() {
+        UserDefaults.standard.removeObject(forKey: pendingScreenRecordingFreshProcessKey)
+        UserDefaults.standard.removeObject(forKey: pendingScreenRecordingFreshProcessAttemptsKey)
+    }
+
+    private func relaunchInstalledAppAndTerminate() {
+        let script = "sleep 0.5; open /Applications/LocalClicky.app"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script]
+        do {
+            try process.run()
+        } catch {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/LocalClicky.app"))
+        }
+        NSApp.terminate(nil)
     }
 
     private var isVerifyingPreviouslyConfirmedScreenRecording = false

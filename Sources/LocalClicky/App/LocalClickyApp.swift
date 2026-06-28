@@ -73,7 +73,7 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        companionManager.refreshAllPermissions()
+        companionManager.refreshPermissionsAfterAppBecameActive()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
