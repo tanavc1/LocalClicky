@@ -17,6 +17,28 @@ analytics. Nothing you say, see, or ask ever leaves the machine.** The only
 network traffic is HTTP to a local [Ollama](https://ollama.com) server on
 `127.0.0.1`.
 
+---
+
+## ⬇️ Download
+
+<p align="center">
+  <a href="https://github.com/tanavc1/LocalClicky/releases/latest/download/LocalClicky.dmg">
+    <img src="https://img.shields.io/badge/Download-LocalClicky.dmg-2563EB?style=for-the-badge&logo=apple&logoColor=white" alt="Download LocalClicky.dmg">
+  </a>
+</p>
+
+**[Download LocalClicky.dmg →](https://github.com/tanavc1/LocalClicky/releases/latest/download/LocalClicky.dmg)** Open it, drag **LocalClicky** to **Applications**, and launch it. *(Apple-silicon Mac, macOS 14.2+.)*
+
+Or do the whole thing — download, install, launch — in **one line** (and skip the Gatekeeper prompt):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tanavc1/LocalClicky/main/scripts/web-install.sh | bash
+```
+
+> **First open from the DMG:** the app is signed with a local certificate (not notarized by Apple), so the first launch of the *downloaded* copy needs one click of approval — right-click **LocalClicky** in Applications → **Open** → **Open** (on macOS 15, instead use **System Settings → Privacy & Security → Open Anyway**). The one-line installer above does this for you. After that, click the menu-bar icon, grant the 3 permissions, and hold **Control + Option** to talk — the app's panel installs Ollama + the local models for you.
+
+---
+
 | Capability | Original Clicky | LocalClicky |
 |---|---|---|
 | Speech-to-text (push-to-talk) | AssemblyAI (cloud) | **Apple Speech, on-device** |
@@ -37,7 +59,9 @@ Mac except the single, clearly-flagged, opt-in web lookup.
 
 ---
 
-## Install (one command)
+## Build from source (developers)
+
+> Just want to use it? Use the [**Download**](#️-download) above — you don't need any of this.
 
 You need three things first — all free, all one-time:
 
@@ -79,6 +103,7 @@ scripts/install.sh            # build + clean-install to /Applications (resets p
 scripts/update.sh             # rebuild + reinstall in place, KEEPING your permissions
 scripts/build-app.sh          # just build dist/LocalClicky.app (no install)
 scripts/package-dmg.sh        # wrap it into a drag-to-Applications DMG
+scripts/release.sh            # build + DMG + publish the GitHub Release (maintainers)
 ```
 
 > **Updating later?** Use `scripts/update.sh` — it reinstalls the new build with
