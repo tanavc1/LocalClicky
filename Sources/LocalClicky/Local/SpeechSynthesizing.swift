@@ -56,6 +56,12 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
     private var neural: PiperSpeechSynthesisClient?
     private let fallback: AppleSpeechSynthesisClient
     private var hasDisabledNeuralVoice = false
+    private var consecutiveNeuralFailures = 0
+    /// Only give up on the neural voice for the rest of the session after this
+    /// many *consecutive* failures. A single slow or stalled synthesis — e.g. the
+    /// one-time graph warm-up cost on the very first utterance, or a momentary CPU
+    /// spike — must not be enough to lose the good-sounding voice for good.
+    private let neuralFailureToleranceBeforeFallback = 3
 
     /// True if the high-quality neural voice is the one in use.
     var isUsingNeuralVoice: Bool { neural != nil && !hasDisabledNeuralVoice }
@@ -76,27 +82,43 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
         if let neural, !hasDisabledNeuralVoice {
             do {
                 try await speakWithNeuralTimeout(neural, text: text)
+                consecutiveNeuralFailures = 0
                 return
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                // Neural synthesis hiccuped or stalled — don't go silent.
-                print("⚠️ Neural TTS unavailable (\(error)); using Apple voice fallback.")
+                // Neural synthesis hiccuped or stalled — speak this one line with
+                // the Apple voice so the companion never goes silent, but keep the
+                // neural voice for the next line. Only after several consecutive
+                // failures (a genuinely broken neural path) do we switch away for
+                // the rest of the session.
+                consecutiveNeuralFailures += 1
                 neural.stopPlayback()
-                self.neural = nil
-                hasDisabledNeuralVoice = true
+                if consecutiveNeuralFailures >= neuralFailureToleranceBeforeFallback {
+                    print("⚠️ Neural TTS failed \(consecutiveNeuralFailures)× in a row (\(error)); using the Apple voice for the rest of this session.")
+                    self.neural = nil
+                    hasDisabledNeuralVoice = true
+                } else {
+                    print("⚠️ Neural TTS hiccup #\(consecutiveNeuralFailures) (\(error)); speaking this line with the Apple voice.")
+                }
             }
         }
         try await fallback.speakText(text)
     }
 
     private func speakWithNeuralTimeout(_ neural: PiperSpeechSynthesisClient, text: String) async throws {
+        // The timeout budget scales with how much text we're synthesizing and is
+        // generous enough to absorb the one-time graph warm-up on the first
+        // utterance. Real synthesis runs ~20× faster than real time on Apple
+        // silicon, so this only ever trips on a genuine stall — not on normal
+        // (even cold) use, which is what used to wrongly drop us to the Apple voice.
+        let timeoutSeconds = min(20.0, 6.0 + Double(text.count) * 0.05)
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await neural.speakText(text)
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: 2_500_000_000)
+                try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
                 throw SpeechSynthesisError.neuralTimedOut
             }
 

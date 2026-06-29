@@ -277,6 +277,10 @@ final class CompanionManager: ObservableObject {
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
         isOverlayVisible = true
         guard !hasSeenIntro else { return }
+        // Mark it seen now so the greeting + joke play exactly once, ever — not on
+        // every launch. (Persisted immediately rather than after the async intro so
+        // a quick relaunch can't replay it.)
+        hasSeenIntro = true
         // Small delay so the cursor has faded in before the intro starts typing.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             self?.playFirstRunIntro()
@@ -661,8 +665,14 @@ final class CompanionManager: ObservableObject {
         if hasScreenRecordingPermission {
             clearPendingScreenRecordingFreshProcess()
         }
-        if !currentlyHasScreenRecording && hadPreviouslyConfirmedScreenRecording {
-            verifyPreviouslyConfirmedScreenRecordingStillWorks()
+        // Trust System Settings: whenever the fast cached check isn't already a
+        // definite "yes", ask the OS directly (via ScreenCaptureKit) whether we
+        // can actually capture, and reconcile in both directions. This flips the
+        // app to "granted" the moment a grant made while running takes effect —
+        // even though CGPreflightScreenCaptureAccess() is still returning a stale
+        // false — and flips it back to "not granted" if the grant was revoked.
+        if !currentlyHasScreenRecording {
+            reconcileScreenRecordingPermissionWithSystem()
         }
 
         let micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -751,20 +761,53 @@ final class CompanionManager: ObservableObject {
         NSApp.terminate(nil)
     }
 
-    private var isVerifyingPreviouslyConfirmedScreenRecording = false
+    private var isReconcilingScreenRecordingWithSystem = false
+    private var lastScreenRecordingReconcileTime = Date.distantPast
 
-    private func verifyPreviouslyConfirmedScreenRecordingStillWorks() {
-        guard !isVerifyingPreviouslyConfirmedScreenRecording else { return }
-        isVerifyingPreviouslyConfirmedScreenRecording = true
+    /// Asks the OS (authoritatively, via ScreenCaptureKit) whether the app can
+    /// actually read the screen right now and updates `hasScreenRecordingPermission`
+    /// to match — in both directions. This is what lets the app believe System
+    /// Settings over the stale `CGPreflightScreenCaptureAccess()` cache: a grant
+    /// made while the app is running starts working without the preflight value
+    /// ever flipping to true, and a revoked grant should drop us back to "not
+    /// granted" so the Grant button reappears instead of capture silently failing.
+    /// Single-flight and throttled so the 1.5 s permission poll can call it freely
+    /// without spawning overlapping capture queries.
+    private func reconcileScreenRecordingPermissionWithSystem() {
+        guard !isReconcilingScreenRecordingWithSystem else { return }
+        guard Date().timeIntervalSince(lastScreenRecordingReconcileTime) > 2.5 else { return }
+        isReconcilingScreenRecordingWithSystem = true
+        lastScreenRecordingReconcileTime = Date()
         Task {
-            let canReadScreenContent = (try? await SCShareableContent.excludingDesktopWindows(
-                false, onScreenWindowsOnly: true)) != nil
+            let canCapture = await WindowPositionManager.canCaptureScreenContentNow()
             await MainActor.run {
-                self.isVerifyingPreviouslyConfirmedScreenRecording = false
-                guard !canReadScreenContent else { return }
-                WindowPositionManager.clearPreviouslyConfirmedScreenRecordingPermission()
-                self.hasScreenRecordingPermission = false
-                print("⚠️ Screen Recording fallback was stale; cleared saved confirmation.")
+                self.isReconcilingScreenRecordingWithSystem = false
+                if canCapture {
+                    // The OS is letting us capture → System Settings really did
+                    // grant it. Believe that even if the cached preflight value
+                    // still says no.
+                    if !self.hasScreenRecordingPermission {
+                        print("✅ Screen Recording is actually working now (System Settings grant is active); clearing the prompt.")
+                    }
+                    WindowPositionManager.markScreenRecordingPermissionConfirmed()
+                    let wasMissingAPermission = !self.allPermissionsGranted
+                    self.hasScreenRecordingPermission = true
+                    self.clearPendingScreenRecordingFreshProcess()
+                    // Granting screen recording may have completed the full set —
+                    // reveal the cursor/intro just as the synchronous path would.
+                    if wasMissingAPermission && self.allPermissionsGranted
+                        && self.isClickyCursorEnabled && !self.isOverlayVisible {
+                        self.presentOverlayAndIntroIfNeeded()
+                    }
+                } else if !WindowPositionManager.hasScreenRecordingPermission() {
+                    // The OS won't let us capture AND the cached flag agrees → the
+                    // grant is gone (revoked, or it was a stale saved confirmation).
+                    if WindowPositionManager.hasPreviouslyConfirmedScreenRecordingPermission() {
+                        WindowPositionManager.clearPreviouslyConfirmedScreenRecordingPermission()
+                        print("⚠️ Screen Recording is no longer available; cleared the saved confirmation.")
+                    }
+                    self.hasScreenRecordingPermission = false
+                }
             }
         }
     }
