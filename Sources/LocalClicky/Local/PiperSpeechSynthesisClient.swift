@@ -182,19 +182,30 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
     private func enqueue(_ wav: Data) -> Bool {
         clipQueue.append(wav)
         isPlaying = true
-        return playNextIfIdle()
+        startNextIfIdle()
+        return true
     }
 
-    private func playNextIfIdle() -> Bool {
-        guard player?.isPlaying != true else { return true }
+    /// Starts the next queued clip *only when nothing is currently the active
+    /// player*. Advancement between clips is otherwise driven solely by the
+    /// finish-delegate (guarded by player identity). This is what prevents the
+    /// cut-off bug: when a freshly-synthesized clip was enqueued in the gap
+    /// between a clip finishing and its delegate running, the old code could start
+    /// the next clip *and then* have the stale delegate nil out that
+    /// now-current-and-playing player — silencing it mid-sentence. Keying every
+    /// transition off `player == nil` + the delegate's identity check makes each
+    /// clip play to completion before the next begins.
+    private func startNextIfIdle() {
+        guard player == nil else { return }
         guard !clipQueue.isEmpty else {
             isPlaying = false
-            return true
+            return
         }
         let wav = clipQueue.removeFirst()
         do {
             let newPlayer = try AVAudioPlayer(data: wav)
             newPlayer.delegate = self
+            newPlayer.prepareToPlay()
             player = newPlayer
             isPlaying = true
             // If playback can't actually start, the finish-delegate never fires,
@@ -202,20 +213,23 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
             // loop and anything that waits on isPlaying. Drop the clip and move on.
             if !newPlayer.play() {
                 player = nil
-                return clipQueue.isEmpty ? false : playNextIfIdle()
+                startNextIfIdle()
             }
-            return true
         } catch {
             // Skip the bad clip and keep going rather than getting stuck.
-            return clipQueue.isEmpty ? false : playNextIfIdle()
+            startNextIfIdle()
         }
     }
 
     // Delegate callbacks arrive off the main actor — hop back before touching state.
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+    nonisolated func audioPlayerDidFinishPlaying(_ finishedPlayer: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
+            // Only advance when the player that finished is still the active one;
+            // a stale callback from an already-superseded clip must not nil out
+            // (and thus silence) the clip currently playing.
+            guard self.player === finishedPlayer else { return }
             self.player = nil
-            _ = self.playNextIfIdle()
+            self.startNextIfIdle()
         }
     }
 

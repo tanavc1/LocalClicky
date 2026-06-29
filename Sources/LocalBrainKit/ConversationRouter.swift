@@ -32,6 +32,10 @@ public enum ConversationRoute: Equatable, Sendable {
     /// click / find something. Routed to the grounding model (e.g. qwen2.5vl)
     /// which returns the pixel coordinates that fly the blue cursor.
     case screenPoint
+    /// Capture the screen, ground a UI element, fly the cursor to it, **and
+    /// actually click it** — the user told LocalClicky to click/press something
+    /// ("click the submit button"), not just to show where it is.
+    case screenClick
     case text
     case browserCommand
     /// Open / launch a local macOS application ("launch spotify", "open the
@@ -78,14 +82,17 @@ public enum ConversationRouter {
     public static func route(transcript: String, context: Context) -> ConversationRoute {
         let text = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // A "where do I click…/point at…" question is about the screen, even when
-        // it mentions "open settings" or a site name — so detect it first and
-        // don't let the app/browser launcher hijack a pointing question (e.g.
-        // "where do i click to open settings" must point, not launch Settings).
-        let isPointingQuestion = wantsPointing(text)
+        // A "where do I click…/point at…" question — or an imperative "click the
+        // X" — is about the screen, even when it mentions "open settings" or a
+        // site name. Detect both first so the app/browser launcher can't hijack
+        // them (e.g. "where do i click to open settings" must point, not launch
+        // Settings; "click the new tab button" must click on screen, not open a
+        // browser tab).
+        let isClickCommand = wantsClick(text)
+        let isPointingQuestion = isClickCommand || wantsPointing(text)
 
         // 1) Deterministic action requests win over questions, in order of how
-        //    unambiguous they are — but never over a pointing question.
+        //    unambiguous they are — but never over a pointing/click request.
         //    a) "copy your answer to the clipboard" — refers to what we just said.
         if wantsCopyLastAnswer(text) { return .copyLastAnswer }
         //    a2) "give me X in text" / "give text" — answer in the blue side-text.
@@ -106,17 +113,45 @@ public enum ConversationRouter {
         // 2) No screen this turn (text-only mode, or no permission) → text path.
         guard context.visionModeSelected, context.screenAvailable else { return .text }
 
-        // 3) Vision mode with the screen available is the default. Only divert to
-        //    the text model when the turn is clearly self-contained.
-        if isClearlyTextOnly(text, context: context) { return .text }
-        // 4) Distinguish "point at / where do I click" (needs grounding coords)
-        //    from "describe / what's on screen" (the default vision model). The
-        //    two use different models + prompts since Moondream can't ground.
+        // 3) Direct screen interactions: click an element, or point at one.
+        if isClickCommand { return .screenClick }
         if isPointingQuestion { return .screenPoint }
-        return .screen
+
+        // 4) Be a normal assistant by DEFAULT, and only look at the screen when the
+        //    user is actually referring to it ("this", "on screen", a highlighted
+        //    selection, a UI element, "what am i looking at"). This is the key fix
+        //    for "it just describes my screen on every question" — a plain question
+        //    the user could ask any assistant ("what's the time", "tell me a joke")
+        //    no longer triggers a screenshot + screen-grounded answer.
+        if referencesScreen(text) { return .screen }
+        return .text
     }
 
-    // MARK: - Pointing vs describing
+    // MARK: - Pointing / clicking / describing
+
+    /// True when the user is telling LocalClicky to actually *click* (or press /
+    /// tap / hit / select) something on screen — an imperative action, not a
+    /// question about where something is. "where do i click" / "show me where"
+    /// stay pointing (the user wants to be shown, not have it clicked for them).
+    static func wantsClick(_ text: String) -> Bool {
+        // Asking *where* / *how* is a pointing question, never an action.
+        if text.contains("where") || text.contains("show me")
+            || text.hasPrefix("how do i") || text.hasPrefix("how can i") {
+            return false
+        }
+        let actionPhrases = [
+            " click the", " click on", "click it", "click that", "click here",
+            "press the", "press on", "tap the", "tap on", "hit the",
+            "double click", "double-click", "go ahead and click", "can you click",
+            "please click", "select the", "choose the",
+        ]
+        if actionPhrases.contains(where: text.contains) { return true }
+        // Bare imperative at the very start: "click ...", "press ...", "tap ...".
+        for verb in ["click ", "press ", "tap ", "hit "] where text.hasPrefix(verb) {
+            return true
+        }
+        return false
+    }
 
     /// True when the user wants the blue cursor to *point* at something on screen
     /// (where to click, find a button, etc.) rather than just hear it described.
@@ -143,6 +178,23 @@ public enum ConversationRouter {
         let locateCue = text.contains("find ") || text.contains("locate ") || text.contains("where")
         if locateCue && uiNouns.contains(where: text.contains) { return true }
         return false
+    }
+
+    /// True when the user is actually referring to what's on their screen — so we
+    /// should look at it — rather than asking a self-contained question. This is
+    /// what keeps LocalClicky from screenshotting + describing on every turn: the
+    /// screen is used only on a positive reference to it.
+    static func referencesScreen(_ text: String) -> Bool {
+        if hasScreenDeixis(text) { return true }
+        let screenIntents = [
+            "what am i looking at", "what's on my", "whats on my", "what is on my",
+            "on this page", "on the page", "this page", "this article", "this code",
+            "this text", "this image", "this diagram", "this error", "this line",
+            "this paragraph", "this selection", "my selection", "the highlighted",
+            "what i'm reading", "what im reading", "summarize this", "explain this",
+            "what is this", "what does this say", "translate this", "read this",
+        ]
+        return screenIntents.contains(where: text.contains)
     }
 
     // MARK: - Clipboard

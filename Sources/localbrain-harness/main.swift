@@ -481,6 +481,16 @@ func runSelfTest() -> Never {
     check("'open the file menu' is NOT browser", route("open the file menu", ctx()) == .screen)
     check("text mode never screens", route("what's on my screen", ctx(vision: false)) == .text)
     check("no screen permission falls back to text", route("where do i click", ctx(screen: false)) == .text)
+    // Default is the text assistant — a plain question must NOT screenshot/describe.
+    check("'tell me a joke' → text (not screen)", route("tell me a joke", ctx()) == .text)
+    check("'what time is it' → text (not screen)", route("what time is it", ctx()) == .text)
+    check("'explain quantum computing' → text (not screen)", route("explain quantum computing", ctx()) == .text)
+    // Imperative "click X" actually clicks; "where do i click" only points.
+    check("'click the submit button' → screenClick", route("click the submit button", ctx()) == .screenClick)
+    check("'press the play button' → screenClick", route("press the play button", ctx()) == .screenClick)
+    check("'go ahead and click the link' → screenClick", route("go ahead and click the link", ctx()) == .screenClick)
+    check("'where do i click' stays screenPoint (not click)", route("where do i click to save", ctx()) == .screenPoint)
+    check("click with no screen → text", route("click the submit button", ctx(screen: false)) == .text)
 
     // --- SpokenTextSegmenter (streaming TTS) ---
     check("speakablePrefix cuts at pointing tag",
