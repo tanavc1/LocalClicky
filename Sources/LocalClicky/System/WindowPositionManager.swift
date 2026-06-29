@@ -107,8 +107,33 @@ class WindowPositionManager {
         UserDefaults.standard.bool(forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
     }
 
+    static func markScreenRecordingPermissionConfirmed() {
+        UserDefaults.standard.set(true, forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
+    }
+
     static func clearPreviouslyConfirmedScreenRecordingPermission() {
         UserDefaults.standard.removeObject(forKey: hasPreviouslyConfirmedScreenRecordingPermissionUserDefaultsKey)
+    }
+
+    /// Authoritative, *live* check of whether this running process can actually
+    /// read the screen right now — the ground truth that must always win over the
+    /// cached `CGPreflightScreenCaptureAccess()` value.
+    ///
+    /// `CGPreflightScreenCaptureAccess()` returns a value that is cached per
+    /// process and is **not** refreshed when the user flips Screen Recording on
+    /// while the app is already running: it keeps returning `false` even though
+    /// System Settings now shows the app as granted. ScreenCaptureKit, by
+    /// contrast, re-checks authorization on every request — so a successful
+    /// `SCShareableContent` query means the OS is genuinely letting us capture,
+    /// i.e. it agrees with what System Settings shows. macOS *throws* when the app
+    /// is not authorized, so simply reaching the return is the positive signal.
+    static func canCaptureScreenContentNow() async -> Bool {
+        do {
+            _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Prompts the system dialog for Screen Recording permission.
