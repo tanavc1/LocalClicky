@@ -53,11 +53,12 @@ protocol SpeechSynthesizing: AnyObject {
 /// path never leaves the companion silent.
 @MainActor
 final class SpeechSynthesisCoordinator: SpeechSynthesizing {
-    private let neural: PiperSpeechSynthesisClient?
+    private var neural: PiperSpeechSynthesisClient?
     private let fallback: AppleSpeechSynthesisClient
+    private var hasDisabledNeuralVoice = false
 
     /// True if the high-quality neural voice is the one in use.
-    var isUsingNeuralVoice: Bool { neural != nil }
+    var isUsingNeuralVoice: Bool { neural != nil && !hasDisabledNeuralVoice }
 
     init() {
         neural = PiperSpeechSynthesisClient.make()
@@ -72,18 +73,41 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
     var isPlaying: Bool { (neural?.isPlaying ?? false) || fallback.isPlaying }
 
     func speakText(_ text: String) async throws {
-        if let neural {
+        if let neural, !hasDisabledNeuralVoice {
             do {
-                try await neural.speakText(text)
+                try await speakWithNeuralTimeout(neural, text: text)
                 return
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                // Neural synthesis hiccuped — don't go silent, use Apple voice.
-                print("⚠️ Neural TTS failed (\(error)); falling back to Apple voice.")
+                // Neural synthesis hiccuped or stalled — don't go silent.
+                print("⚠️ Neural TTS unavailable (\(error)); using Apple voice fallback.")
+                neural.stopPlayback()
+                self.neural = nil
+                hasDisabledNeuralVoice = true
             }
         }
         try await fallback.speakText(text)
+    }
+
+    private func speakWithNeuralTimeout(_ neural: PiperSpeechSynthesisClient, text: String) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await neural.speakText(text)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 2_500_000_000)
+                throw SpeechSynthesisError.neuralTimedOut
+            }
+
+            do {
+                _ = try await group.next()
+                group.cancelAll()
+            } catch {
+                group.cancelAll()
+                throw error
+            }
+        }
     }
 
     func stopPlayback() {
@@ -94,5 +118,9 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
     /// Pays the one-time graph warm-up so the first real answer speaks instantly.
     func warmUp() {
         neural?.warmUp()
+    }
+
+    enum SpeechSynthesisError: Error {
+        case neuralTimedOut
     }
 }

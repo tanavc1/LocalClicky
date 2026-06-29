@@ -96,7 +96,9 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
             throw PiperError.synthesisFailed
         }
         try Task.checkCancellation()
-        enqueue(wav)
+        guard enqueue(wav) else {
+            throw PiperError.playbackFailed
+        }
     }
 
     func stopPlayback() {
@@ -177,15 +179,18 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
 
     // MARK: - Playback queue
 
-    private func enqueue(_ wav: Data) {
+    private func enqueue(_ wav: Data) -> Bool {
         clipQueue.append(wav)
         isPlaying = true
-        playNextIfIdle()
+        return playNextIfIdle()
     }
 
-    private func playNextIfIdle() {
-        guard player?.isPlaying != true else { return }
-        guard !clipQueue.isEmpty else { isPlaying = false; return }
+    private func playNextIfIdle() -> Bool {
+        guard player?.isPlaying != true else { return true }
+        guard !clipQueue.isEmpty else {
+            isPlaying = false
+            return true
+        }
         let wav = clipQueue.removeFirst()
         do {
             let newPlayer = try AVAudioPlayer(data: wav)
@@ -197,11 +202,12 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
             // loop and anything that waits on isPlaying. Drop the clip and move on.
             if !newPlayer.play() {
                 player = nil
-                playNextIfIdle()
+                return clipQueue.isEmpty ? false : playNextIfIdle()
             }
+            return true
         } catch {
             // Skip the bad clip and keep going rather than getting stuck.
-            playNextIfIdle()
+            return clipQueue.isEmpty ? false : playNextIfIdle()
         }
     }
 
@@ -209,7 +215,7 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
             self.player = nil
-            self.playNextIfIdle()
+            _ = self.playNextIfIdle()
         }
     }
 
@@ -240,5 +246,5 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
         return nil
     }
 
-    enum PiperError: Error { case synthesisFailed }
+    enum PiperError: Error { case synthesisFailed, playbackFailed }
 }
