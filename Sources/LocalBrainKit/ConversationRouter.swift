@@ -268,17 +268,31 @@ public enum ConversationRouter {
         ]
         if explicitMarkers.contains(where: text.contains) { return true }
 
-        // High-confidence "needs live data" questions that essentially always
-        // require the internet and almost never refer to the screen or to general
-        // knowledge a small local model already has. Kept tight to avoid wrongly
-        // leaving the no-cloud guarantee on a casual question.
+        // "Needs live/current data" questions — things that change over time and
+        // that a static local model can't reliably know. Deliberately uses
+        // specific phrases (not bare "now"/"today"/"this") so it never steals an
+        // on-screen question like "what's on my screen right now".
         let liveDataMarkers = [
-            "weather", "forecast", "temperature outside",
+            // weather
+            "weather", "forecast", "temperature outside", "how hot is it", "how cold is it",
+            // money / markets
             "stock price", "share price", "stock market", "price of ", "how much is ",
-            "how much does ", " cost right now", "exchange rate", "how much are ",
+            "how much does ", "how much are ", " cost right now", "exchange rate",
+            "net worth", "market cap", "worth right now", "how much money does",
+            // sports / scores
             "who won the", "what was the score", "the final score", "the score of",
-            "headlines", "in the news", "news about", "news on",
-            "currently the president", "current president", "who is the president",
+            "who is winning", "who's winning", "world cup", "super bowl", "playoffs",
+            // news / current events
+            "headlines", "in the news", "news about", "news on", "latest on", "what happened to",
+            // people in changing roles / current facts
+            "current president", "current ceo", "current prime minister", "current pope",
+            "current king", "current queen", "current champion", "current leader",
+            "current governor", "current mayor", "currently the",
+            "who is the president", "who's the president", "who is the ceo", "who's the ceo",
+            "who is the current", "who's the current", "who runs ", "who owns ",
+            "as of today", "as of now", "up to date", "most recent", "this year's",
+            "release date", "when does it come out", "when is it coming out",
+            "how old is", "how many people live", "population of",
         ]
         return liveDataMarkers.contains(where: text.contains)
     }

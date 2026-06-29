@@ -1358,8 +1358,8 @@ final class CompanionManager: ObservableObject {
             let synthesis = try await ollamaClient.streamChat(
                 model: chatModelName,
                 messages: [.system(LocalPrompts.webAnswer),
-                           .user("question: \(transcript)\n\nweb results:\n\(results)")],
-                temperature: 0.3,
+                           .user("question: \(transcript)\n\nfetched web content (source of truth):\n\(results)")],
+                temperature: 0.0,
                 maxTokens: 200,
                 keepAlive: hardwareRecommendation.keepAlive,
                 contextWindow: contextWindow(forModel: chatModelName),
