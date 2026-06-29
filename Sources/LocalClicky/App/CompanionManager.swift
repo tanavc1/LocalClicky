@@ -970,8 +970,11 @@ final class CompanionManager: ObservableObject {
                     return
                 }
 
-                let useScreen = (route == .screen || route == .screenPoint)
-                let wantsPointing = (route == .screenPoint)
+                // A click turn grounds the element exactly like a pointing turn
+                // (same grounding model + tag); it just also clicks at the end.
+                let performClick = (route == .screenClick)
+                let useScreen = (route == .screen || route == .screenPoint || route == .screenClick)
+                let wantsPointing = (route == .screenPoint || route == .screenClick)
 
                 var cursorScreenCapture: CompanionScreenCapture?
                 let systemPrompt: String
@@ -988,9 +991,13 @@ final class CompanionManager: ObservableObject {
                         // describe instead of asking it for empty coordinates.
                         let pointingModel = resolvedGroundingModelName()
                         if LocalModels.isLikelyGroundingCapable(pointingModel) {
-                            systemPrompt = LocalPrompts.screenPointResponse(
-                                imageWidthInPixels: capture.screenshotWidthInPixels,
-                                imageHeightInPixels: capture.screenshotHeightInPixels)
+                            systemPrompt = performClick
+                                ? LocalPrompts.screenClickResponse(
+                                    imageWidthInPixels: capture.screenshotWidthInPixels,
+                                    imageHeightInPixels: capture.screenshotHeightInPixels)
+                                : LocalPrompts.screenPointResponse(
+                                    imageWidthInPixels: capture.screenshotWidthInPixels,
+                                    imageHeightInPixels: capture.screenshotHeightInPixels)
                         } else {
                             systemPrompt = LocalPrompts.screenDescribe(
                                 imageWidthInPixels: capture.screenshotWidthInPixels,
@@ -1012,7 +1019,16 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                var messages: [OllamaChatMessage] = [.system(systemPrompt)]
+                // Give conversational turns awareness of the real-world clock so
+                // "what time is it / what's today's date / what day is it" work —
+                // the model has no clock of its own. Pointing/click turns get the
+                // tight grounding prompt untouched (time is irrelevant + would only
+                // distract the tag output).
+                let systemWithContext = wantsPointing
+                    ? systemPrompt
+                    : systemPrompt + "\n\n" + Self.currentEnvironmentContext()
+
+                var messages: [OllamaChatMessage] = [.system(systemWithContext)]
                 for exchange in conversationHistory {
                     messages.append(.user(exchange.userTranscript))
                     messages.append(.assistant(exchange.assistantResponse))
@@ -1038,11 +1054,19 @@ final class CompanionManager: ObservableObject {
                     }
                 }
 
+                // Pointing/click turns want just a sentence + tag; describe and
+                // text turns get enough room to finish a real thought (the prompt
+                // still asks for brevity) so answers don't get truncated mid-word.
+                let answerMaxTokens: Int = {
+                    if wantsPointing { return 130 }
+                    if cursorScreenCapture == nil { return 420 }
+                    return 320
+                }()
                 let result = try await ollamaClient.streamChat(
                     model: model,
                     messages: messages,
                     temperature: cursorScreenCapture == nil ? 0.7 : 0.3,
-                    maxTokens: cursorScreenCapture == nil ? 220 : 180,
+                    maxTokens: answerMaxTokens,
                     keepAlive: hardwareRecommendation.keepAlive,
                     contextWindow: contextWindow(forModel: model),
                     onText: { accumulated in
@@ -1078,6 +1102,12 @@ final class CompanionManager: ObservableObject {
                     detectedElementScreenLocation = globalLocation
                     detectedElementDisplayFrame = capture.displayFrame
                     print("🎯 Pointing at \"\(pointing.label ?? "element")\" → (\(Int(center.x)), \(Int(center.y))) px")
+                    // On a click turn, let the blue cursor visibly fly to the
+                    // target first, then perform a real click there so the user
+                    // sees exactly what's about to be clicked.
+                    if performClick {
+                        scheduleRealClick(atGlobalAppKitPoint: globalLocation)
+                    }
                 }
 
                 conversationHistory.append((userTranscript: transcript, assistantResponse: spokenText))
@@ -1244,12 +1274,12 @@ final class CompanionManager: ObservableObject {
             return
         }
         lastSpokenAnswer = answer
-        // Blue text is the primary output for this command; also speak it since
-        // LocalClicky is voice-first.
-        streamSideText(answer, characterInterval: 0.02, holdSeconds: 10, autoDismiss: true)
-        voiceState = .responding
-        do { try await speechSynthesizer.speakText(answer) }
-        catch { print("⚠️ TTS error during give-text: \(error)") }
+        // The user explicitly asked for the answer *in text*, so this turn is
+        // text-only: render it in the blue side-text and do NOT speak it. (Every
+        // other route is voice-first; this is the one the user opts into for a
+        // silent, readable answer.)
+        streamSideText(answer, characterInterval: 0.02, holdSeconds: 12, autoDismiss: true)
+        voiceState = .idle
     }
 
     // MARK: - Web reach (the one opt-in internet feature)
@@ -1404,6 +1434,32 @@ final class CompanionManager: ObservableObject {
             x: displayLocalX + displayFrame.origin.x,
             y: appKitY + displayFrame.origin.y
         )
+    }
+
+    /// A short present-tense line describing the real-world context (current
+    /// date, weekday, and local time) appended to conversational system prompts so
+    /// the model can answer "what time is it / what's today's date / what day is
+    /// it" — it has no clock of its own and otherwise guesses or refuses.
+    static func currentEnvironmentContext() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a"
+        let stamp = formatter.string(from: Date())
+        return "for reference, the user's current local date and time is \(stamp). if they ask what time/day/date it is, answer from this naturally and spoken-style; otherwise ignore it."
+    }
+
+    /// Performs a real click at the grounded element after letting the blue
+    /// cursor visibly fly there first. Only ever called on an explicit click turn
+    /// (route `.screenClick`) — never on describe/point turns — and a click is the
+    /// only action it can take.
+    private func scheduleRealClick(atGlobalAppKitPoint appKitPoint: CGPoint) {
+        let cgPoint = ClickActionExecutor.cgGlobalPoint(fromAppKitGlobalPoint: appKitPoint)
+        // Give the cursor animation ~0.9s to land on the target so the click is
+        // clearly telegraphed, then click.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+            print("🖱️ Click: at CG (\(Int(cgPoint.x)), \(Int(cgPoint.y)))")
+            ClickActionExecutor.click(atCGGlobalPoint: cgPoint)
+        }
     }
 
     private func formatLatencyBadge(_ result: OllamaChatResult) -> String? {
