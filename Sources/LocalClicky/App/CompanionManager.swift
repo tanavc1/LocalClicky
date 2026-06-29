@@ -122,6 +122,10 @@ final class CompanionManager: ObservableObject {
     /// TTS; works with the network off.
     private let speechSynthesizer = SpeechSynthesisCoordinator()
 
+    /// In-app countdown timers ("set a timer for 4 minutes"). Announces out loud
+    /// when each one finishes.
+    private let timerService = TimerService()
+
     /// Model-picker identities. "Vision" sends a screenshot to the local VLM so
     /// Clicky can see the screen and point; "Text" uses the faster text-only
     /// model when the screen isn't relevant.
@@ -210,6 +214,13 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        timerService.onTimerFinished = { [weak self] spokenDuration in
+            guard let self else { return }
+            let message = "time's up — your \(spokenDuration) timer is done."
+            self.streamSideText(message, holdSeconds: 8, autoDismiss: true)
+            self.voiceState = .responding
+            Task { try? await self.speechSynthesizer.speakText(message); self.voiceState = .idle }
+        }
         refreshAllPermissions()
         print("🔑 LocalClicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), introSeen: \(hasSeenIntro)")
         startPermissionPolling()
@@ -835,7 +846,13 @@ final class CompanionManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRecording, isFinalizing, isPreparing in
                 guard let self else { return }
-                guard self.voiceState != .responding else { return }
+                // While speaking an answer we keep showing "responding" so an idle
+                // dictation state doesn't stomp it — but the instant the user
+                // starts a new turn (records/finalizes/prepares), we switch to that
+                // state. Without this, a turn that began while still speaking could
+                // leave the UI wedged on "responding".
+                let userIsInteracting = isRecording || isFinalizing || isPreparing
+                if self.voiceState == .responding && !userIsInteracting { return }
                 if isFinalizing {
                     self.voiceState = .processing
                 } else if isRecording {
@@ -966,6 +983,16 @@ final class CompanionManager: ObservableObject {
                 }
                 if route == .webReach {
                     await handleWebReachCommand(transcript: transcript)
+                    settleAfterAction()
+                    return
+                }
+                if route == .setTimer {
+                    await handleSetTimer(transcript: transcript)
+                    settleAfterAction()
+                    return
+                }
+                if route == .spotify {
+                    await handleSpotifyCommand(transcript: transcript)
                     settleAfterAction()
                     return
                 }
@@ -1291,6 +1318,19 @@ final class CompanionManager: ObservableObject {
     /// feature that leaves the no-cloud guarantee.
     private func handleWebReachCommand(transcript: String) async {
         voiceState = .processing
+
+        // Weather goes to a dedicated, accurate source (general search results
+        // don't carry live conditions).
+        if WebReachTool.isWeatherQuery(transcript) {
+            streamSideText("checking the weather…", autoDismiss: false)
+            if let report = await WebReachTool.weatherReport(forQuery: transcript) {
+                guard !Task.isCancelled else { dismissSideText(); return }
+                await synthesizeAndSpeakWebAnswer(transcript: transcript, results: report)
+                return
+            }
+            // Fall through to a normal web search if the weather source failed.
+        }
+
         streamSideText("checking the web…", autoDismiss: false)
 
         let results = await WebReachTool.search(transcript)
@@ -1306,6 +1346,13 @@ final class CompanionManager: ObservableObject {
             return
         }
 
+        await synthesizeAndSpeakWebAnswer(transcript: transcript, results: results)
+    }
+
+    /// Has the local text model synthesize a spoken answer grounded only in the
+    /// fetched web/weather results, then speaks it. Shared by the weather and the
+    /// general-search paths.
+    private func synthesizeAndSpeakWebAnswer(transcript: String, results: String) async {
         var answer = ""
         do {
             let synthesis = try await ollamaClient.streamChat(
@@ -1313,7 +1360,7 @@ final class CompanionManager: ObservableObject {
                 messages: [.system(LocalPrompts.webAnswer),
                            .user("question: \(transcript)\n\nweb results:\n\(results)")],
                 temperature: 0.3,
-                maxTokens: 180,
+                maxTokens: 200,
                 keepAlive: hardwareRecommendation.keepAlive,
                 contextWindow: contextWindow(forModel: chatModelName),
                 onText: { _ in })
@@ -1341,6 +1388,57 @@ final class CompanionManager: ObservableObject {
         voiceState = .responding
         do { try await speechSynthesizer.speakText(answer) }
         catch { print("⚠️ TTS error during web-reach: \(error)") }
+    }
+
+    // MARK: - Computer use (timer + Spotify)
+
+    /// Starts an in-app countdown timer and confirms it out loud. The timer
+    /// announces itself when it finishes (see `timerService.onTimerFinished`).
+    private func handleSetTimer(transcript: String) async {
+        previousTurnUsedScreen = false
+        guard let request = ComputerActionPlanner.timerRequest(from: transcript) else {
+            let message = "tell me how long, like set a timer for five minutes."
+            voiceState = .responding
+            do { try await speechSynthesizer.speakText(message) } catch {}
+            return
+        }
+        timerService.startTimer(seconds: request.seconds, spokenDuration: request.spokenDuration)
+        print("⏲️ Timer: set for \(request.seconds)s (\(request.spokenDuration))")
+        let message = "okay, timer set for \(request.spokenDuration). i'll let you know when it's done."
+        conversationHistory.append((userTranscript: transcript, assistantResponse: message))
+        voiceState = .responding
+        do { try await speechSynthesizer.speakText(message) }
+        catch { print("⚠️ TTS error during timer: \(error)") }
+    }
+
+    /// Controls the Spotify desktop app for an explicit "… on spotify" command.
+    private func handleSpotifyCommand(transcript: String) async {
+        previousTurnUsedScreen = false
+        guard let action = ComputerActionPlanner.spotifyAction(from: transcript) else { return }
+
+        let outcome = SpotifyController.perform(action)
+        let message: String
+        switch outcome {
+        case .notInstalled:
+            message = "i don't see spotify installed on your mac."
+        case .permissionDenied:
+            message = "i need permission to control spotify — allow it under privacy and security, automation."
+        case .failed:
+            message = "i couldn't get spotify to do that just now."
+        case .ok:
+            switch action {
+            case .play: message = "playing on spotify."
+            case .pause: message = "paused spotify."
+            case .next: message = "skipping to the next track."
+            case .previous: message = "going back a track."
+            case .playQuery(let query): message = "pulling up \(query) on spotify."
+            }
+        }
+        print("🎵 Spotify: \(action) → \(outcome)")
+        conversationHistory.append((userTranscript: transcript, assistantResponse: message))
+        voiceState = .responding
+        do { try await speechSynthesizer.speakText(message) }
+        catch { print("⚠️ TTS error during spotify: \(error)") }
     }
 
     // MARK: - First-run intro (blue side-text) + screen-aware joke

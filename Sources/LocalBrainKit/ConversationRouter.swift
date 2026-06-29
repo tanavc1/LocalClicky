@@ -51,6 +51,12 @@ public enum ConversationRoute: Equatable, Sendable {
     /// "what's the latest…"). Fetches + synthesizes via WebReachTool. This is the
     /// one route that leaves the no-cloud guarantee, so it's narrowly triggered.
     case webReach
+    /// Set + start a countdown timer ("set a timer for 4 minutes"). Handled by an
+    /// in-app timer that speaks/notifies when it finishes.
+    case setTimer
+    /// Control the Spotify desktop app ("play despacito on spotify", "pause
+    /// spotify", "next song on spotify"). Handled via the Spotify scripting bridge.
+    case spotify
 }
 
 public enum ConversationRouter {
@@ -98,10 +104,22 @@ public enum ConversationRouter {
         //    a2) "give me X in text" / "give text" — answer in the blue side-text.
         if wantsShowText(text) { return .showText }
         if !isPointingQuestion {
-            //    a3) "look it up online" / "what's the latest…" — fetch from the
-            //        web and answer. Checked before the browser so "search the web
-            //        and tell me" gets an answer instead of just opening a tab.
+            //    a3) "search X on my computer" / "google X" — search in the browser.
+            //        Checked before web-reach so an explicit "google the weather"
+            //        opens the browser instead of being read aloud.
+            if ComputerActionPlanner.computerSearchQuery(from: text) != nil { return .browserCommand }
+            //    a4) "look it up online" / "what's the weather" — fetch from the web
+            //        and answer aloud. After the explicit-browser check above so
+            //        "google X" wins, but before app/browser so "search the web and
+            //        tell me" gets an answer instead of just opening a tab.
             if wantsWebReach(text) { return .webReach }
+            //    a5) "set a timer for 4 minutes" — start a countdown.
+            if ComputerActionPlanner.timerRequest(from: text) != nil { return .setTimer }
+            //    a6) "play despacito on spotify" / "pause spotify" — control Spotify.
+            //        Checked before openApp so "play X on spotify" controls the app
+            //        instead of just launching it. ("open spotify" has no playback
+            //        verb, so it still falls through to openApp.)
+            if ComputerActionPlanner.spotifyAction(from: text) != nil { return .spotify }
             //    b) "launch spotify" / "open the notes app" — open an installed app.
             //       Checked before the browser so explicit app phrasing isn't read
             //       as a website (e.g. "launch spotify" opens the app, not the site).
@@ -240,14 +258,29 @@ public enum ConversationRouter {
     /// the only route that leaves the no-cloud guarantee, so it must require an
     /// explicit internet marker, never fire on a plain local question.
     static func wantsWebReach(_ text: String) -> Bool {
-        let markers = [
+        // Explicit "use the internet" phrasing.
+        let explicitMarkers = [
             "online", "on the internet", "on the web", "from the web", "from the internet",
             "the latest", "latest news", "what's new with", "whats new with",
             "what does the internet say", "search the internet", "search the web and",
             "look it up online", "look that up online", "look this up online",
             "check the web", "check online", "google it and tell", "according to the internet",
         ]
-        return markers.contains(where: text.contains)
+        if explicitMarkers.contains(where: text.contains) { return true }
+
+        // High-confidence "needs live data" questions that essentially always
+        // require the internet and almost never refer to the screen or to general
+        // knowledge a small local model already has. Kept tight to avoid wrongly
+        // leaving the no-cloud guarantee on a casual question.
+        let liveDataMarkers = [
+            "weather", "forecast", "temperature outside",
+            "stock price", "share price", "stock market", "price of ", "how much is ",
+            "how much does ", " cost right now", "exchange rate", "how much are ",
+            "who won the", "what was the score", "the final score", "the score of",
+            "headlines", "in the news", "news about", "news on",
+            "currently the president", "current president", "who is the president",
+        ]
+        return liveDataMarkers.contains(where: text.contains)
     }
 
     // MARK: - Browser commands

@@ -105,6 +105,17 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             if let globalEventTap {
                 CGEvent.tapEnable(tap: globalEventTap, enable: true)
             }
+            // The tap was disabled (usually because the main thread was briefly
+            // busy and the tap timed out), so we may have MISSED the key-release
+            // flagsChanged event. If we still think the shortcut is held, we'd be
+            // stuck "listening" forever with no way to release. Treat a disable
+            // while-pressed as a release: the worst case is a slightly early end
+            // to a hold, which is far better than a wedged listening state that
+            // the user can't exit. The next genuine press starts fresh.
+            if isShortcutCurrentlyPressed {
+                isShortcutCurrentlyPressed = false
+                shortcutTransitionPublisher.send(.released)
+            }
             return Unmanaged.passUnretained(event)
         }
 

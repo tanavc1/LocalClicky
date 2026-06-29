@@ -583,9 +583,45 @@ func runSelfTest() -> Never {
     check("'search the web and tell me' → webReach",
           route("search the web and tell me who won", ctx()) == .webReach)
     check("plain local question is NOT webReach", route("what's the capital of france", ctx()) == .text)
+    check("'what's the weather' → webReach (needs live data)", route("what's the weather today", ctx()) == .webReach)
+    check("'price of bitcoin' → webReach", route("what's the price of bitcoin", ctx()) == .webReach)
+    check("'who won the' game → webReach", route("who won the lakers game", ctx()) == .webReach)
+    check("general knowledge stays local, NOT webReach", route("explain how photosynthesis works", ctx()) == .text)
     check("'open gmail' still → browserCommand (not webReach)", route("open gmail", ctx()) == .browserCommand)
+    check("webReach fallback URL targets r.jina.ai", WebReachTool.fallbackSearchURL(for: "x")?.host == "r.jina.ai")
     check("webReach search URL targets r.jina.ai", WebReachTool.searchURL(for: "nobel prize")?.host == "r.jina.ai")
     check("webReach read URL targets r.jina.ai", WebReachTool.readURL(for: "example.com")?.host == "r.jina.ai")
+
+    // --- Computer use: timer routing + parsing ---
+    check("'set a timer for 4 minutes' → setTimer", route("set a timer for 4 minutes", ctx()) == .setTimer)
+    check("'timer for 30 seconds' → setTimer", route("set a timer for 30 seconds", ctx()) == .setTimer)
+    check("'two minute timer' → setTimer", route("give me a two minute timer", ctx()) == .setTimer)
+    check("plain question is NOT a timer", route("what's the capital of france", ctx()) != .setTimer)
+    check("timer parse: 4 minutes = 240s", ComputerActionPlanner.timerRequest(from: "set a timer for 4 minutes")?.seconds == 240)
+    check("timer parse: 30 seconds = 30s", ComputerActionPlanner.timerRequest(from: "timer for 30 seconds")?.seconds == 30)
+    check("timer parse: word 'two minutes' = 120s", ComputerActionPlanner.timerRequest(from: "a two minute timer")?.seconds == 120)
+    check("timer parse: '1 hour 30 minutes' = 5400s", ComputerActionPlanner.timerRequest(from: "set a timer for 1 hour 30 minutes")?.seconds == 5400)
+    check("timer parse: no duration → nil", ComputerActionPlanner.timerRequest(from: "set a timer") == nil)
+
+    // --- Computer use: Spotify routing + parsing ---
+    check("'play despacito on spotify' → spotify", route("play despacito on spotify", ctx()) == .spotify)
+    check("'pause spotify' → spotify", route("pause spotify", ctx()) == .spotify)
+    check("'next song on spotify' → spotify", route("next song on spotify", ctx()) == .spotify)
+    check("'open spotify' is NOT spotify-control", route("open spotify", ctx()) != .spotify)
+    check("'launch spotify' opens the app, not spotify-control", route("launch spotify", ctx()) == .openApp)
+    check("plain 'play' (no spotify) is NOT spotify", route("play", ctx()) != .spotify)
+    check("spotify parse: play query", ComputerActionPlanner.spotifyAction(from: "play bohemian rhapsody on spotify") == .playQuery("bohemian rhapsody"))
+    check("spotify parse: pause", ComputerActionPlanner.spotifyAction(from: "pause spotify") == .pause)
+    check("spotify parse: next", ComputerActionPlanner.spotifyAction(from: "skip this song on spotify") == .next)
+    check("spotify parse: bare play", ComputerActionPlanner.spotifyAction(from: "play spotify") == .play)
+
+    // --- Computer use: explicit browser search ("on my computer" / "in google") ---
+    check("'search cats on my computer' → browserCommand", route("search cats on my computer", ctx()) == .browserCommand)
+    check("'search cats in google' → browserCommand", route("search cats in google", ctx()) == .browserCommand)
+    check("'google the weather' → browserCommand", route("google the weather", ctx()) == .browserCommand)
+    check("computer search query strips 'on my computer'", ComputerActionPlanner.computerSearchQuery(from: "search cats on my computer") == "cats")
+    check("computer search query strips 'in google'", ComputerActionPlanner.computerSearchQuery(from: "search the eiffel tower in google") == "the eiffel tower")
+    check("bare 'search cats' is NOT a computer search", ComputerActionPlanner.computerSearchQuery(from: "search cats") == nil)
 
     // --- Prompt integrity (describe vs point vs honest concise) ---
     check("conciseText forbids made-up facts", LocalPrompts.conciseText.contains("never make up"))
