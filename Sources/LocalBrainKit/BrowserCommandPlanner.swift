@@ -93,6 +93,17 @@ public enum BrowserCommandPlanner {
             return sitePlan
         }
 
+        // Explicit "search X on my computer / in google / google X" → a Google
+        // results page (opened in Chrome if present by the executor). Handled
+        // here so the "on my computer / in google" phrasing is cleaned correctly.
+        if let computerQuery = ComputerActionPlanner.computerSearchQuery(from: text) {
+            let encoded = computerQuery.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? computerQuery
+            return BrowserPlan(
+                actions: [BrowserAction(url: "https://www.google.com/search?q=\(encoded)",
+                                        label: "search for \(computerQuery)")],
+                spokenSummary: "searching google for \(computerQuery).")
+        }
+
         var actions: [BrowserAction] = []
         var labels: [String] = []
 

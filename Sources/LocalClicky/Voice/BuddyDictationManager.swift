@@ -291,6 +291,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private var shouldAutomaticallySubmitFinalDraft = false
     private var hasFinishedCurrentDictationSession = false
     private var finalizeFallbackWorkItem: DispatchWorkItem?
+    /// Hard safety net: if a recording somehow never receives its stop (e.g. the
+    /// global key-up was lost while the event tap was disabled), this force-ends
+    /// it so the app can never get wedged in "listening". A normal push-to-talk
+    /// hold is a few seconds; this only ever trips on a genuinely stuck session.
+    private var recordingWatchdogWorkItem: DispatchWorkItem?
+    private static let maxRecordingDurationSeconds: TimeInterval = 60
     private var pendingStartRequestIdentifier = UUID()
     private var contextualKeyterms: [String] = []
     private var lastRecordedAudioPowerSampleDate = Date.distantPast
@@ -480,6 +486,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 microphoneButtonRecordingStartedAt = Date()
             }
             isPreparingToRecord = false
+            startRecordingWatchdog(for: startSource)
             print("🎙️ BuddyDictationManager: recognition session started")
         } catch {
             isPreparingToRecord = false
@@ -593,8 +600,17 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             throw BuddyDictationError.microphoneUnavailable
         }
 
+        // Capture the session STRONGLY in the tap block instead of reading
+        // `self.activeTranscriptionSession` from inside it. The tap runs on the
+        // audio render thread; reading a @MainActor-isolated property from there
+        // while the main thread tears the session down (stop/cancel sets it to
+        // nil and deallocates it) is a data race / use-after-free that corrupts
+        // the heap — which later surfaces as an unrelated EXC_BAD_ACCESS (e.g. a
+        // SwiftUI button-tap segfault). Holding our own reference keeps the
+        // session valid for the lifetime of the tap; `removeTap` releases it.
+        let session = activeTranscriptionSession
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
+            session.appendAudioBuffer(buffer)
             self?.updateAudioPowerLevel(from: buffer)
         }
 
@@ -669,7 +685,31 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         return draftTextBeforeCurrentDictation + " " + trimmedTranscriptText
     }
 
+    /// Arms the stuck-session safety net for an active recording. If the matching
+    /// session is still recording after the max duration, it's force-finalized
+    /// (keyboard) or force-stopped (mic button) so "listening" can never persist.
+    private func startRecordingWatchdog(for startSource: BuddyDictationStartSource) {
+        recordingWatchdogWorkItem?.cancel()
+        let watchdog = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isActivelyRecordingAudio,
+                      self.activeStartSource == startSource else { return }
+                print("⏱️ BuddyDictationManager: recording watchdog fired — force-ending a stuck session")
+                switch startSource {
+                case .keyboardShortcut:
+                    self.stopPushToTalk(expectedStartSource: .keyboardShortcut)
+                case .microphoneButton:
+                    self.cancelCurrentDictation(preserveDraftText: true)
+                }
+            }
+        }
+        recordingWatchdogWorkItem = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.maxRecordingDurationSeconds, execute: watchdog)
+    }
+
     private func resetSessionState() {
+        recordingWatchdogWorkItem?.cancel()
+        recordingWatchdogWorkItem = nil
         pendingStartRequestIdentifier = UUID()
         activeTranscriptionSession = nil
         draftCallbacks = nil
