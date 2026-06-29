@@ -143,7 +143,13 @@ public enum LocalPrompts {
     public static let webAnswer = """
     \(identity)
 
-    you just looked something up on the web for the user. below is their question and the web results you fetched. answer in one or two short spoken sentences, using ONLY what's in the results. if the results don't actually contain the answer, say you couldn't find it rather than guessing. all lowercase, casual, no markdown, no urls, no lists — it's read aloud.
+    you just looked something up on the live web. the fetched page content below is the SOURCE OF TRUTH and is more current than anything you remember. your own training memory is very likely OUT OF DATE for this question, so you must IGNORE what you think you know and answer ONLY from the content below. if the content says the answer is X, your answer says X — even if you remember it differently.
+
+    rules:
+    - read the content, find the answer, and state it directly and confidently — as if you simply know it. do NOT narrate ("the results say", "according to the page", "top result"); just give the fact.
+    - if multiple sources disagree, use the most recent.
+    - only if the content genuinely does not contain the answer, say you couldn't find it — never fall back on a remembered guess.
+    - one or two short spoken sentences, all lowercase, casual, no markdown, no urls, no lists. it's read aloud.
     """
 
     /// "give me X in text" / "give text" command. The answer is shown in the blue

@@ -2,49 +2,42 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleName</key>
-	<string>LocalClicky</string>
 	<key>CFBundleDisplayName</key>
 	<string>LocalClicky</string>
+	<key>CFBundleExecutable</key>
+	<string>LocalClicky</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.localclicky.LocalClicky</string>
-	<key>CFBundleExecutable</key>
+	<key>CFBundleName</key>
 	<string>LocalClicky</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.3</string>
+	<string>1.0.4</string>
 	<key>CFBundleVersion</key>
-	<string>4</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
+	<string>5</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.2</string>
-	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
-	<key>NSHighResolutionCapable</key>
-	<true/>
-	<!-- Menu-bar-only: no dock icon, no app menu. -->
 	<key>LSUIElement</key>
 	<true/>
-	<!-- TCC usage strings. LocalClicky only ever uses these locally. -->
-	<key>NSMicrophoneUsageDescription</key>
-	<string>LocalClicky uses your microphone so you can talk to it. Audio is transcribed on-device and never leaves your Mac.</string>
-	<key>NSScreenCaptureUsageDescription</key>
-	<string>LocalClicky captures a screenshot only when you press the hot key, so the local vision model can see your screen and point at things. The screenshot never leaves your Mac.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>LocalClicky uses on-device speech recognition to transcribe your voice. Nothing is sent to any server.</string>
-	<!-- Required for controlling the Spotify desktop app via Apple events when you
-	     ask LocalClicky to play or pause music. Without this string macOS aborts
-	     the app the moment it sends an Apple event. -->
-	<key>NSAppleEventsUsageDescription</key>
-	<string>LocalClicky controls apps like Spotify on your Mac only when you explicitly ask it to (for example, "play music on Spotify"). This stays on your Mac.</string>
-	<!-- Allow http to the local Ollama server on 127.0.0.1. No other networking
-	     is used anywhere in the app. -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>LocalClicky controls apps like Spotify on your Mac only when you explicitly ask it to (for example, "play music on Spotify"). This stays on your Mac.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>LocalClicky uses your microphone so you can talk to it. Audio is transcribed on-device and never leaves your Mac.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>LocalClicky captures a screenshot only when you press the hot key, so the local vision model can see your screen and point at things. The screenshot never leaves your Mac.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>LocalClicky uses on-device speech recognition to transcribe your voice. Nothing is sent to any server.</string>
 </dict>
 </plist>

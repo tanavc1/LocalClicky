@@ -587,8 +587,18 @@ func runSelfTest() -> Never {
     check("'price of bitcoin' → webReach", route("what's the price of bitcoin", ctx()) == .webReach)
     check("'who won the' game → webReach", route("who won the lakers game", ctx()) == .webReach)
     check("general knowledge stays local, NOT webReach", route("explain how photosynthesis works", ctx()) == .text)
+    check("'who is the current ceo of X' → webReach", route("who is the current ceo of twitter", ctx()) == .webReach)
+    check("'who is the president' → webReach", route("who is the president right now", ctx()) == .webReach)
+    check("'latest on the election' → webReach", route("what's the latest on the election", ctx()) == .webReach)
+    check("'on my screen right now' stays screen (not webReach)", route("what is on my screen right now", ctx()) == .screen)
+    check("extractResultURLs decodes ddg uddg redirects",
+          WebReachTool.extractResultURLs(from: "x [a](https://duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FX) y").contains("https://en.wikipedia.org/wiki/X"))
     check("'open gmail' still → browserCommand (not webReach)", route("open gmail", ctx()) == .browserCommand)
     check("webReach fallback URL targets r.jina.ai", WebReachTool.fallbackSearchURL(for: "x")?.host == "r.jina.ai")
+    check("freshness bias appends current year when none present",
+          WebReachTool.freshnessBiasedQuery("who won the super bowl", now: Date(timeIntervalSince1970: 1_780_000_000)).hasSuffix("2026"))
+    check("freshness bias leaves an explicit year alone",
+          WebReachTool.freshnessBiasedQuery("who won the 2014 super bowl") == "who won the 2014 super bowl")
     check("webReach search URL targets r.jina.ai", WebReachTool.searchURL(for: "nobel prize")?.host == "r.jina.ai")
     check("webReach read URL targets r.jina.ai", WebReachTool.readURL(for: "example.com")?.host == "r.jina.ai")
 
@@ -607,7 +617,7 @@ func runSelfTest() -> Never {
     check("'play despacito on spotify' → spotify", route("play despacito on spotify", ctx()) == .spotify)
     check("'pause spotify' → spotify", route("pause spotify", ctx()) == .spotify)
     check("'next song on spotify' → spotify", route("next song on spotify", ctx()) == .spotify)
-    check("'open spotify' is NOT spotify-control", route("open spotify", ctx()) != .spotify)
+    check("'open spotify' opens the desktop app (not web)", route("open spotify", ctx()) == .openApp)
     check("'launch spotify' opens the app, not spotify-control", route("launch spotify", ctx()) == .openApp)
     check("plain 'play' (no spotify) is NOT spotify", route("play", ctx()) != .spotify)
     check("spotify parse: play query", ComputerActionPlanner.spotifyAction(from: "play bohemian rhapsody on spotify") == .playQuery("bohemian rhapsody"))
@@ -881,8 +891,8 @@ func runWebReach(query: String) async {
     let answer = try? await client.streamChat(
         model: LocalModels.chatModel,
         messages: [.system(LocalPrompts.webAnswer),
-                   .user("question: \(query)\n\nweb results:\n\(results)")],
-        temperature: 0.3, maxTokens: 180, contextWindow: LocalModels.textContextWindow, onText: { _ in })
+                   .user("question: \(query)\n\nfetched web content (source of truth):\n\(results)")],
+        temperature: 0.0, maxTokens: 180, contextWindow: LocalModels.textContextWindow, onText: { _ in })
     print("\nanswer: \(answer?.text ?? "nil")")
     exit((answer?.text.isEmpty == false) ? 0 : 1)
 }

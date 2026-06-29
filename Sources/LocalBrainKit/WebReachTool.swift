@@ -31,10 +31,27 @@ public enum WebReachTool {
     }
 
     /// Builds a keyless search URL: Jina Reader over a DuckDuckGo HTML results
-    /// page. Returns ranked results (titles, snippets, links) as markdown.
+    /// page. Returns ranked results (titles, snippets, links) as markdown. The
+    /// query is biased toward current results (year appended + past-year date
+    /// filter) so "who won the last super bowl" surfaces this year's recap, not a
+    /// decade-old page — the difference between a right and a stale answer.
     public static func searchURL(for query: String) -> URL? {
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        return URL(string: "\(jinaReaderBase)https://duckduckgo.com/html/?q=\(encoded)")
+        let augmented = freshnessBiasedQuery(query)
+        let encoded = augmented.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? augmented
+        return URL(string: "\(jinaReaderBase)https://duckduckgo.com/html/?q=\(encoded)&df=y")
+    }
+
+    /// Appends the current year to a query that doesn't already name one, so the
+    /// search ranks recent pages higher. Pure + deterministic for testing.
+    public static func freshnessBiasedQuery(_ query: String, now: Date = Date()) -> String {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.range(of: "\\b(19|20)\\d{2}\\b", options: .regularExpression) != nil {
+            return trimmed
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let year = calendar.component(.year, from: now)
+        return "\(trimmed) \(year)"
     }
 
     /// Fetches markdown from a Jina Reader URL, truncated to `maxCharacters` so a
@@ -62,29 +79,91 @@ public enum WebReachTool {
     /// when the primary results page comes back empty or rate-limited, so a single
     /// transient hiccup doesn't turn into "i couldn't reach the web".
     public static func fallbackSearchURL(for query: String) -> URL? {
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        let augmented = freshnessBiasedQuery(query)
+        let encoded = augmented.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? augmented
         return URL(string: "\(jinaReaderBase)https://lite.duckduckgo.com/lite/?q=\(encoded)")
     }
 
-    /// Searches the web (keyless) and returns the results page as markdown. Tries
-    /// the primary results page, then a fallback source, so an occasional empty
-    /// or rate-limited response still yields an answer.
+    /// Searches the web (keyless) and returns content for the model to answer
+    /// from. Crucially this is a **two-step** read: it gets the ranked results
+    /// page (titles + snippets) AND then *reads the top result pages themselves*
+    /// for fresh, full content. Snippets alone are thin and often stale, which is
+    /// why a snippet-only answer can be out of date ("who's the CEO of X"); the
+    /// actual top pages carry the current answer. Top pages are read concurrently
+    /// to keep it fast, and everything degrades gracefully to snippets/fallback.
     public static func search(_ query: String) async -> String? {
-        if let url = searchURL(for: query),
-           let primary = await fetchMarkdown(url),
-           primary.count > 200 {
-            return primary
+        // 1) Ranked results page (snippets + the result links).
+        var resultsPage = await fetchMarkdown(searchURL(for: query) ?? URL(fileURLWithPath: "/"), maxCharacters: 4000)
+        if (resultsPage?.count ?? 0) < 200, let fallbackURL = fallbackSearchURL(for: query) {
+            resultsPage = await fetchMarkdown(fallbackURL, maxCharacters: 4000)
         }
-        if let fallbackURL = fallbackSearchURL(for: query) {
-            return await fetchMarkdown(fallbackURL)
+
+        // 2) Read the top couple of real result pages for fresh, complete content.
+        let topURLs = Array(extractResultURLs(from: resultsPage ?? "").prefix(2))
+        let pageContents = await withTaskGroup(of: String?.self) { group -> [String] in
+            for pageURL in topURLs {
+                group.addTask { await read(pageURL, maxCharacters: 3500) }
+            }
+            var collected: [String] = []
+            for await page in group {
+                if let page, !page.isEmpty { collected.append(page) }
+            }
+            return collected
         }
-        return nil
+
+        // 3) Combine: the read page content first (it's the richest + freshest),
+        //    then the snippets as backup context.
+        var combined = ""
+        for content in pageContents {
+            combined += "\n\n---\n\(content)"
+        }
+        if let resultsPage {
+            combined += "\n\n--- additional snippets ---\n\(resultsPage)"
+        }
+        combined = combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        return combined.isEmpty ? nil : String(combined.prefix(7000))
+    }
+
+    /// Pulls the real destination URLs out of a DuckDuckGo HTML results page
+    /// (their links are wrapped as `…/l/?uddg=<percent-encoded-real-url>`), plus
+    /// any bare http(s) links, skipping DuckDuckGo's own and obvious non-articles.
+    public static func extractResultURLs(from markdown: String) -> [String] {
+        var urls: [String] = []
+        var seen = Set<String>()
+
+        func consider(_ candidate: String) {
+            guard candidate.hasPrefix("http"), candidate.count < 300 else { return }
+            let lowered = candidate.lowercased()
+            // Skip the search engine's own links and asset/login junk.
+            for bad in ["duckduckgo.com", "/l/?", "google.com/search", "bing.com",
+                        ".css", ".js", ".png", ".jpg", ".svg", "/login", "/signin"] where lowered.contains(bad) {
+                return
+            }
+            let normalized = candidate.hasSuffix("/") ? String(candidate.dropLast()) : candidate
+            if seen.insert(normalized).inserted { urls.append(normalized) }
+        }
+
+        // 1) Decode the uddg=<real-url> redirect parameters (DuckDuckGo HTML).
+        let nsText = markdown as NSString
+        if let regex = try? NSRegularExpression(pattern: "uddg=([^&)\\s\"']+)") {
+            for match in regex.matches(in: markdown, range: NSRange(location: 0, length: nsText.length)) {
+                let encoded = nsText.substring(with: match.range(at: 1))
+                if let decoded = encoded.removingPercentEncoding { consider(decoded) }
+            }
+        }
+        // 2) Plain markdown links as a fallback.
+        if let regex = try? NSRegularExpression(pattern: "\\((https?://[^)\\s]+)\\)") {
+            for match in regex.matches(in: markdown, range: NSRange(location: 0, length: nsText.length)) {
+                consider(nsText.substring(with: match.range(at: 1)))
+            }
+        }
+        return urls
     }
 
     /// Reads a specific page and returns it as markdown.
-    public static func read(_ pageURL: String) async -> String? {
+    public static func read(_ pageURL: String, maxCharacters: Int = 6000) async -> String? {
         guard let url = readURL(for: pageURL) else { return nil }
-        return await fetchMarkdown(url)
+        return await fetchMarkdown(url, maxCharacters: maxCharacters)
     }
 
     // MARK: - Weather (a dedicated, accurate, keyless source)

@@ -92,7 +92,16 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        guard let wav = await engine.synthesize(trimmed) else {
+        // When playback is starting from cold (nothing currently playing or
+        // queued), the audio output device takes a moment to spin up and would
+        // otherwise swallow the first ~100ms of speech — the "cut off at the
+        // beginning" problem. Prepend a short silence so the warm-up eats the
+        // silence, not the first word. Mid-answer clips don't need it (the device
+        // is already running), so they stay gapless.
+        let isColdStart = (player == nil && clipQueue.isEmpty)
+        let leadInSilenceSeconds = isColdStart ? 0.18 : 0.0
+
+        guard let wav = await engine.synthesize(trimmed, leadInSilenceSeconds: leadInSilenceSeconds) else {
             throw PiperError.synthesisFailed
         }
         try Task.checkCancellation()
@@ -136,26 +145,33 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
         init(handle: TTSHandle) { self.handle = handle }
 
         /// Synthesizes `text` to an in-memory WAV, or nil if generation fails.
-        func synthesize(_ text: String) -> Data? {
+        /// `leadInSilenceSeconds` prepends that much silence so a cold audio
+        /// device doesn't clip the first word.
+        func synthesize(_ text: String, leadInSilenceSeconds: Double = 0) -> Data? {
             guard let audio = text.withCString({
                 SherpaOnnxOfflineTtsGenerate(handle.pointer, $0, 0, 1.0)
             }) else { return nil }
             defer { SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio) }
             let generated = audio.pointee
             guard let samples = generated.samples, generated.n > 0 else { return nil }
+            let sampleRate = Int(generated.sample_rate)
+            let leadInSamples = max(0, Int(leadInSilenceSeconds * Double(sampleRate)))
             return PiperSpeechSynthesisClient.makeWAVData(
                 samples: samples, count: Int(generated.n),
-                sampleRate: Int(generated.sample_rate))
+                sampleRate: sampleRate, leadInSilenceSamples: leadInSamples)
         }
     }
 
     /// Wraps mono float32 samples in [-1, 1] as a 16-bit PCM WAV so AVAudioPlayer
     /// can play them straight from memory (no temp file).
-    private nonisolated static func makeWAVData(samples: UnsafePointer<Float>, count: Int, sampleRate: Int) -> Data {
+    private nonisolated static func makeWAVData(samples: UnsafePointer<Float>, count: Int, sampleRate: Int,
+                                                leadInSilenceSamples: Int = 0) -> Data {
         let channels = 1, bitsPerSample = 16
         let blockAlign = channels * bitsPerSample / 8
         let byteRate = sampleRate * blockAlign
-        let dataSize = count * blockAlign
+        let leadIn = max(0, leadInSilenceSamples)
+        let totalSamples = count + leadIn
+        let dataSize = totalSamples * blockAlign
 
         var data = Data(capacity: 44 + dataSize)
         func putString(_ s: String) { data.append(contentsOf: s.utf8) }
@@ -168,10 +184,10 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
         putU16(UInt16(blockAlign)); putU16(UInt16(bitsPerSample))
         putString("data"); putU32(UInt32(dataSize))
 
-        var pcm = [Int16](repeating: 0, count: count)
+        var pcm = [Int16](repeating: 0, count: totalSamples)   // leading entries stay 0 (silence)
         for i in 0..<count {
             let clamped = max(-1.0, min(1.0, samples[i]))
-            pcm[i] = Int16(clamped * 32767.0)
+            pcm[leadIn + i] = Int16(clamped * 32767.0)
         }
         pcm.withUnsafeBytes { data.append(contentsOf: $0) }
         return data

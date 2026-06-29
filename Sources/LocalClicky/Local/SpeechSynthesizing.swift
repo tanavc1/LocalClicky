@@ -87,13 +87,15 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                // Neural synthesis hiccuped or stalled — speak this one line with
-                // the Apple voice so the companion never goes silent, but keep the
-                // neural voice for the next line. Only after several consecutive
-                // failures (a genuinely broken neural path) do we switch away for
-                // the rest of the session.
+                // Neural synthesis hiccuped or stalled on THIS line — speak just
+                // this one with the Apple voice so we never go silent, but keep the
+                // neural voice for the next line. Crucially we do NOT stop neural
+                // playback here: the failed line never got synthesized/enqueued, so
+                // the earlier neural clips are still good and must finish — calling
+                // stopPlayback would wipe the whole queue and cut the answer off
+                // mid-sentence. Only after several consecutive failures (a genuinely
+                // broken path) do we switch away for the rest of the session.
                 consecutiveNeuralFailures += 1
-                neural.stopPlayback()
                 if consecutiveNeuralFailures >= neuralFailureToleranceBeforeFallback {
                     print("⚠️ Neural TTS failed \(consecutiveNeuralFailures)× in a row (\(error)); using the Apple voice for the rest of this session.")
                     self.neural = nil
@@ -101,9 +103,23 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
                 } else {
                     print("⚠️ Neural TTS hiccup #\(consecutiveNeuralFailures) (\(error)); speaking this line with the Apple voice.")
                 }
+                // Let any already-queued neural clips finish before the Apple voice
+                // speaks this line, so the two never overlap and order is preserved.
+                await waitForNeuralPlaybackToDrain(maxSeconds: 8)
             }
         }
         try await fallback.speakText(text)
+    }
+
+    /// Waits (capped) until the neural voice isn't actively playing, so an Apple
+    /// fallback line doesn't overlap neural clips that are still draining.
+    private func waitForNeuralPlaybackToDrain(maxSeconds: Double) async {
+        guard let neural else { return }
+        let deadline = Date().addingTimeInterval(maxSeconds)
+        while neural.isPlaying && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            if Task.isCancelled { return }
+        }
     }
 
     private func speakWithNeuralTimeout(_ neural: PiperSpeechSynthesisClient, text: String) async throws {

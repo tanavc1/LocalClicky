@@ -41,6 +41,10 @@ public enum AppCommandPlanner {
         "xcode", "slack", "discord", "zoom", "telegram", "whatsapp", "obsidian",
         "visual studio code", "vs code", "vscode", "chrome", "google chrome",
         "safari", "firefox", "arc",
+        // Spotify has a real desktop app users expect "open spotify" to launch
+        // (not the web player). If it isn't installed, the open-app handler falls
+        // back to the web automatically.
+        "spotify",
     ]
 
     /// The name of an application to launch, extracted from a spoken command, or
