@@ -82,6 +82,13 @@ public enum OllamaError: Error, LocalizedError {
             return "Couldn't parse Ollama's response: \(detail)"
         }
     }
+
+    /// A short spoken reason when the error body came from the Studio gateway
+    /// (see GatewayErrorSpeech); nil for every other error.
+    public var speakableReason: String? {
+        if case .httpStatus(_, let body) = self { return GatewayErrorSpeech.speakable(fromBody: body) }
+        return nil
+    }
 }
 
 /// Async client for a local Ollama instance. Thread-safe and cheap to hold for
@@ -297,32 +304,27 @@ public final class OllamaClient: @unchecked Sendable {
 
     // MARK: - Streaming chat
 
-    /// Sends one chat turn and streams the response. `onText` is invoked with the
-    /// accumulated text so far (not deltas) each time new tokens arrive — the same
-    /// ergonomics the rest of LocalClicky already uses for progressive display.
-    ///
-    /// - Parameters:
-    ///   - model: an installed Ollama model name.
-    ///   - messages: the full prompt (system + history + current user turn).
-    ///   - temperature: sampling temperature.
-    ///   - maxTokens: hard cap on generated tokens (nil = model default).
-    ///   - keepAlive: how long Ollama keeps the model resident after the call.
-    ///     "10m" keeps it warm between questions so the next answer is instant.
-    ///   - contextWindow: num_ctx for the model. Ollama's default (4096) can be
-    ///     overrun by a screenshot plus several turns of history, which 400s the
-    ///     request. A roomier, *consistent* value avoids that — and it must be the
-    ///     same on every call (warm-up included), or Ollama reloads the model and
-    ///     the warm-up is wasted.
-    @discardableResult
-    public func streamChat(
+    /// The HTTP header that tells the gateway what kind of turn this is, so it can
+    /// route it (studio:clicky sends `ink-describe` turns to a different model).
+    public static let turnHeaderName = "X-Clicky-Turn"
+    /// The user marked something and asks what it is (the gateway sends it to the 9B).
+    public static let inkDescribeTurn = "ink-describe"
+    /// The user marked something and asks more than its name (the gateway sends it to Holo35).
+    public static let inkExplainTurn = "ink-explain"
+
+    /// Builds the `/api/chat` request. `turn` is sent as `X-Clicky-Turn` when
+    /// non-nil; every other turn sends no such header. Pure + static so a unit
+    /// test can inspect the request without a server.
+    static func chatRequest(
+        baseURL: URL,
         model: String,
         messages: [OllamaChatMessage],
-        temperature: Double = 0.7,
-        maxTokens: Int? = nil,
-        keepAlive: String = "10m",
-        contextWindow: Int = 8192,
-        onText: @escaping @Sendable (String) -> Void
-    ) async throws -> OllamaChatResult {
+        temperature: Double,
+        maxTokens: Int?,
+        keepAlive: String,
+        contextWindow: Int,
+        turn: String?
+    ) throws -> URLRequest {
         var requestOptions: [String: Any] = ["temperature": temperature, "num_ctx": contextWindow]
         if let maxTokens { requestOptions["num_predict"] = maxTokens }
 
@@ -345,7 +347,43 @@ public final class OllamaClient: @unchecked Sendable {
         var request = URLRequest(url: baseURL.appendingPathComponent("api/chat"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let turn { request.setValue(turn, forHTTPHeaderField: turnHeaderName) }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return request
+    }
+
+    /// Sends one chat turn and streams the response. `onText` is invoked with the
+    /// accumulated text so far (not deltas) each time new tokens arrive — the same
+    /// ergonomics the rest of LocalClicky already uses for progressive display.
+    ///
+    /// - Parameters:
+    ///   - model: an installed Ollama model name.
+    ///   - messages: the full prompt (system + history + current user turn).
+    ///   - temperature: sampling temperature.
+    ///   - maxTokens: hard cap on generated tokens (nil = model default).
+    ///   - keepAlive: how long Ollama keeps the model resident after the call.
+    ///     "10m" keeps it warm between questions so the next answer is instant.
+    ///   - contextWindow: num_ctx for the model. Ollama's default (4096) can be
+    ///     overrun by a screenshot plus several turns of history, which 400s the
+    ///     request. A roomier, *consistent* value avoids that — and it must be the
+    ///     same on every call (warm-up included), or Ollama reloads the model and
+    ///     the warm-up is wasted.
+    ///   - turn: sent as the `X-Clicky-Turn` header when non-nil (ink describe
+    ///     and ink explain turns pass one); nil sends no header.
+    @discardableResult
+    public func streamChat(
+        model: String,
+        messages: [OllamaChatMessage],
+        temperature: Double = 0.7,
+        maxTokens: Int? = nil,
+        keepAlive: String = "10m",
+        contextWindow: Int = 8192,
+        turn: String? = nil,
+        onText: @escaping @Sendable (String) -> Void
+    ) async throws -> OllamaChatResult {
+        let request = try Self.chatRequest(
+            baseURL: baseURL, model: model, messages: messages, temperature: temperature,
+            maxTokens: maxTokens, keepAlive: keepAlive, contextWindow: contextWindow, turn: turn)
 
         let requestStartDate = Date()
 
@@ -368,6 +406,11 @@ public final class OllamaClient: @unchecked Sendable {
             var errorChunks: [String] = []
             for try await line in byteStream.lines { errorChunks.append(line) }
             let errorBody = errorChunks.joined(separator: "\n")
+            // A gateway error carries its own spoken reason; keep the body so it
+            // can be heard instead of being folded into "model not installed".
+            if GatewayErrorSpeech.speakable(fromBody: errorBody) != nil {
+                throw OllamaError.httpStatus(httpResponse.statusCode, errorBody)
+            }
             if httpResponse.statusCode == 404 || errorBody.lowercased().contains("not found") {
                 throw OllamaError.modelNotInstalled(model)
             }

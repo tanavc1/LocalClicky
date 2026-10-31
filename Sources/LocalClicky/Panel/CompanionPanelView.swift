@@ -42,6 +42,10 @@ struct CompanionPanelView: View {
                 modelsSection
                     .padding(.horizontal, 16)
 
+                drawingSection
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+
                 modelDownloadSection
                     .padding(.horizontal, 16)
                     .padding(.top, 10)
@@ -519,7 +523,8 @@ struct CompanionPanelView: View {
                     .foregroundColor(DS.Colors.textTertiary)
                 Spacer()
                 if companionManager.chatModelName != LocalModels.defaultChatModel
-                    || companionManager.visionModelName != LocalModels.defaultVisionModel {
+                    || companionManager.visionModelName != LocalModels.defaultVisionModel
+                    || companionManager.groundingModelName != LocalModels.defaultGroundingModel {
                     Button("Reset") { companionManager.resetModelsToDefaults() }
                         .buttonStyle(.plain)
                         .font(.system(size: 10, weight: .medium))
@@ -540,6 +545,50 @@ struct CompanionPanelView: View {
                 options: visionModelOptions,
                 role: .vision
             )
+            modelDropdownRow(
+                title: "Pointing",
+                current: companionManager.groundingModelName,
+                options: visionModelOptions,
+                role: .grounding
+            )
+            if companionManager.groundingFallsBackToVision {
+                Text("\(companionManager.groundingModelName) is not installed, so pointing uses the Vision model.")
+                    .font(.system(size: 10, weight: .regular))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: - Drawing (ink style and shapes)
+
+    /// How the ink and the assistant's marks look, and whether Clicky may draw.
+    private var drawingSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("DRAWING")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundColor(DS.Colors.textTertiary)
+                .accessibilityAddTraits(.isHeader)
+
+            InkStyleRow(inkTrail: companionManager.inkTrail)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Toggle(isOn: Binding(
+                    get: { companionManager.drawingEnabled },
+                    set: { companionManager.setDrawingEnabled($0) }
+                )) {
+                    Text("Let Clicky draw (beta)")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+                .toggleStyle(.switch)
+                .tint(DS.Colors.accent)
+
+                Text("Shapes are being tested. They may land in the wrong place.")
+                    .font(.system(size: 10, weight: .regular))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -585,26 +634,10 @@ struct CompanionPanelView: View {
                     }
                 }
             } label: {
-                HStack(spacing: 5) {
-                    Text(current)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.textPrimary)
-                        .lineLimit(1)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundColor(DS.Colors.textTertiary)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.white.opacity(0.06))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                )
+                MenuChip(text: current)
             }
+            .accessibilityLabel("\(title) model")
+            .accessibilityValue(current)
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
@@ -875,4 +908,68 @@ struct CompanionPanelView: View {
         }
     }
 
+}
+
+/// The rounded chip a pop-up menu shows for its current choice.
+private struct MenuChip: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(text)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.textPrimary)
+                .lineLimit(1)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundColor(DS.Colors.textTertiary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+}
+
+/// "Ink style": the four presets. It observes the trail model so the label
+/// follows the choice, and the model re-resolves the style live when it changes.
+private struct InkStyleRow: View {
+    @ObservedObject var inkTrail: InkTrailModel
+
+    var body: some View {
+        HStack {
+            Text("Ink style")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            Menu {
+                ForEach(InkPreset.allCases, id: \.self) { preset in
+                    Button(action: { inkTrail.preset = preset }) {
+                        if preset == inkTrail.preset {
+                            Label(preset.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(preset.displayName)
+                        }
+                    }
+                }
+            } label: {
+                MenuChip(text: inkTrail.preset.displayName)
+            }
+            .accessibilityLabel("Ink style")
+            .accessibilityValue(inkTrail.preset.displayName)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .pointerCursor()
+        }
+        .padding(.vertical, 2)
+    }
 }

@@ -281,6 +281,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         return AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined
     }
 
+    /// Called once the audio engine is running and the mic is open for a new
+    /// session. The turn timer uses it to measure the cold engine start.
+    var onListeningStarted: (() -> Void)?
+
     private let transcriptionProvider: any BuddyTranscriptionProvider
     private let audioEngine = AVAudioEngine()
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
@@ -488,6 +492,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             isPreparingToRecord = false
             startRecordingWatchdog(for: startSource)
             print("🎙️ BuddyDictationManager: recognition session started")
+            onListeningStarted?()
         } catch {
             isPreparingToRecord = false
             lastErrorMessage = userFacingErrorMessage(

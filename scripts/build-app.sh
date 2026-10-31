@@ -90,10 +90,10 @@ fi
 echo "    signing identity: $IDENTITY"
 # Sign the bundled dylibs first (inside-out), so the app signature is valid.
 if [ -d "$SHERPA_DST/lib" ]; then
-  codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$IDENTITY" "$SHERPA_DST/lib/libonnxruntime.1.24.4.dylib"
-  codesign --force "${CODESIGN_KEYCHAIN_ARGS[@]}" --sign "$IDENTITY" "$SHERPA_DST/lib/libsherpa-onnx-c-api.dylib"
+  codesign --force ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} --sign "$IDENTITY" "$SHERPA_DST/lib/libonnxruntime.1.24.4.dylib"
+  codesign --force ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} --sign "$IDENTITY" "$SHERPA_DST/lib/libsherpa-onnx-c-api.dylib"
 fi
-codesign --force --deep "${CODESIGN_KEYCHAIN_ARGS[@]}" --entitlements "$ENT" --sign "$IDENTITY" "$APP"
+codesign --force --deep ${CODESIGN_KEYCHAIN_ARGS[@]+"${CODESIGN_KEYCHAIN_ARGS[@]}"} --entitlements "$ENT" --sign "$IDENTITY" "$APP"
 codesign --verify --verbose "$APP" 2>&1 | tail -1 || true
 # Show the Designated Requirement so it's obvious the identity is cert-anchored
 # (stable) rather than cdhash-pinned (resets permissions on every rebuild).

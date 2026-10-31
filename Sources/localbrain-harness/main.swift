@@ -405,6 +405,20 @@ func runBenchmarkSuite(imagePath: String, iterations: Int, label: String) async 
     print("\n📊 wrote \(jsonPath)\n📊 wrote \(mdPath)")
 }
 
+/// A flat-grey JPEG for the ink-image self-test checks.
+func inkJPEG(width: Int, height: Int) -> Data? {
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+    context.setFillColor(CGColor(gray: 0.5, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    guard let image = context.makeImage() else { return nil }
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(destination, image, nil)
+    return CGImageDestinationFinalize(destination) ? data as Data : nil
+}
+
 /// Dependency-free assertion runner so the pointing-tag parser can be verified
 /// on a Command-Line-Tools-only machine (XCTest needs full Xcode).
 func runSelfTest() -> Never {
@@ -719,6 +733,299 @@ func runSelfTest() -> Never {
     check("pull parse: error surfaced", pp3 == nil && pe3 == "model 'nope' not found")
     let (pp4, _) = OllamaClient.parsePullLine("   ")
     check("pull parse: blank line ignored", pp4 == nil)
+
+    // --- Ink in/out: mapping, strokes, summary, image, accessibility, shape tags ---
+    let inkMap = ScreenMapping(displayFrame: CGRect(x: -1920, y: 0, width: 1920, height: 1080),
+                               displayWidthInPoints: 1920, displayHeightInPoints: 1080,
+                               screenshotWidthInPixels: 1280, screenshotHeightInPixels: 720)
+    check("mapping: forward top-left pixel → AppKit top-left of a left monitor",
+          inkMap.globalPoint(forImagePoint: .zero) == CGPoint(x: -1920, y: 1080))
+    let inkRound = inkMap.imagePoint(forGlobalPoint: inkMap.globalPoint(forImagePoint: CGPoint(x: 321, y: 123)))
+    check("mapping: image → global → image round trip",
+          abs(inkRound.x - 321) < 1e-9 && abs(inkRound.y - 123) < 1e-9)
+    check("mapping: overlay point → pixel",
+          inkMap.imagePoint(forOverlayPoint: CGPoint(x: 960, y: 540)) == CGPoint(x: 640, y: 360))
+
+    func inkCircle(_ degrees: Double) -> [InkSample] {
+        (0...48).map { step in
+            let angle = degrees * Double.pi / 180 * Double(step) / 48
+            return InkSample(point: CGPoint(x: 500 + 80 * cos(angle), y: 400 + 80 * sin(angle)), time: Double(step) * 0.016)
+        }
+    }
+    check("ink: full circle classified as circle", InkStroke(samples: inkCircle(360)).marks().map(\.kind) == [.circle])
+    check("ink: half circle is not a circle", InkStroke(samples: inkCircle(180)).marks().first?.kind != .circle)
+    let inkLine = (0...20).map { InkSample(point: CGPoint(x: 100 + Double($0) * 15, y: 200), time: Double($0) * 0.016) }
+    check("ink: straight run classified as line", InkStroke(samples: inkLine).marks().map(\.kind) == [.line])
+    let inkJiggle = (0..<6).map { InkSample(point: CGPoint(x: 300 + Double($0 % 2) * 3, y: 300), time: Double($0) * 0.02) }
+    check("ink: jiggle is rejected", InkStroke(samples: inkJiggle).analyze().isEmpty)
+    let inkHeld = inkLine + (1...20).map { InkSample(point: CGPoint(x: 400 + Double($0 % 2), y: 200), time: 0.4 + Double($0) * 0.05) }
+    check("ink: a 1 s hold is a dwell", InkStroke(samples: inkHeld).dwells().count == 1)
+    check("ink: region grid names",
+          InkRegion.name(for: CGPoint(x: 10, y: 10), in: CGSize(width: 900, height: 600)) == "top left"
+          && InkRegion.name(for: CGPoint(x: 450, y: 300), in: CGSize(width: 900, height: 600)) == "center"
+          && InkRegion.name(for: CGPoint(x: 890, y: 590), in: CGSize(width: 900, height: 600)) == "bottom right")
+    let inkSummary = GestureSummary.describe(InkStroke(samples: inkCircle(360)).analyze(), screenSize: CGSize(width: 1200, height: 900))
+    check("gesture summary: one circle in the center",
+          inkSummary == "The user drew 1 mark while speaking: circled an area in the center.")
+
+    if let base = inkJPEG(width: 200, height: 120),
+       let inked = InkImage.compositeInk(jpegData: base,
+                                         strokesInImagePixels: [[CGPoint(x: 20, y: 60), CGPoint(x: 180, y: 60)]],
+                                         style: InkPalette.resolve(preset: .standard, increaseContrast: false,
+                                                                   differentiateWithoutColor: false, reduceMotion: false).userInk) {
+        let inkedImage = CGImageSourceCreateWithData(inked as CFData, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+        check("ink image: composite keeps the pixel size", inkedImage?.width == 200 && inkedImage?.height == 120)
+        check("ink image: crop returns a rect inside the image",
+              InkImage.cropAround(jpegData: base, rectInImagePixels: CGRect(x: 90, y: 50, width: 10, height: 10),
+                                  padding: 0.2, minSide: 64, maxLongEdge: 512)?.rectInImagePixels
+                == CGRect(x: 63, y: 23, width: 64, height: 64))
+    } else {
+        check("ink image: synthetic JPEG composite worked", false)
+    }
+    check("ink image: crop rect clamps near a corner",
+          InkImage.cropRect(forInkBounds: CGRect(x: 0, y: 0, width: 10, height: 10),
+                            imageSize: CGSize(width: 1152, height: 748), padding: 0.2, minSide: 320)
+            == CGRect(x: 0, y: 0, width: 320, height: 320))
+
+    let axText = AccessibilitySummary.summarize([
+        AccessibilityElementRecord(role: "AXTextField", title: "Password", value: "hunter2", isSecure: true,
+                                   frame: CGRect(x: 0, y: 0, width: 50, height: 20)),
+        AccessibilityElementRecord(role: "AXButton", title: "Save", frame: CGRect(x: 0, y: 40, width: 50, height: 20)),
+        AccessibilityElementRecord(role: "AXButton", title: "Save", frame: CGRect(x: 90, y: 40, width: 50, height: 20)),
+    ])
+    check("accessibility: secure field dropped, duplicates merged",
+          !axText.contains("hunter2") && !axText.contains("Password") && axText.components(separatedBy: "\"Save\"").count == 2)
+
+    let walkLeaf = (0..<500).map { index in (index, CGRect(x: 100, y: 100, width: 5, height: 5)) }
+    let walkResult = AccessibilityTreeWalk.collect(roots: [-1], inkRect: CGRect(x: 90, y: 90, width: 30, height: 30),
+                                                   frame: { $0 < 0 ? CGRect(x: 0, y: 0, width: 800, height: 600) : walkLeaf[$0].1 },
+                                                   children: { $0 < 0 ? Array(0..<500) : [] })
+    check("accessibility walk: bounded to 200 nodes, keeps only frames that meet the ink",
+          walkResult.visited == 200 && walkResult.stoppedEarly
+          && !AccessibilityTreeWalk.frameOverlaps(CGRect(x: 300, y: 300, width: 10, height: 10), inkRect: CGRect(x: 90, y: 90, width: 30, height: 30)))
+    check("accessibility link: finds an address up to 3 levels, never more",
+          AccessibilityLinkResolver.resolve(from: 0, parent: { $0 < 5 ? $0 + 1 : nil }, url: { $0 == 3 ? "https://x.test" : nil }, label: { _ in nil }).url == "https://x.test"
+          && AccessibilityLinkResolver.resolve(from: 0, parent: { $0 + 1 }, url: { $0 == 4 ? "https://x.test" : nil }, label: { _ in nil }).url == nil)
+    check("ink dwell: report and split thresholds are 0.35 s and 0.6 s",
+          InkStroke.dwellReportDuration == 0.35 && InkStroke.markSplitDuration == 0.6)
+
+    let shapeResult = ShapeTagParser.parse(from: "[SHAPE:circle:500,400;560,400:save:screen2] That is the save button. [HIGHLIGHT:1,2,30,40:form] [POINT:7,8:x]")
+    check("shape tag: circle parsed with label and screen",
+          shapeResult.shapes.first?.kind == .circle && shapeResult.shapes.first?.label == "save"
+          && shapeResult.shapes.first?.screenNumber == 2)
+    check("shape tag: highlight parsed", shapeResult.highlights.first?.rect == CGRect(x: 1, y: 2, width: 29, height: 38))
+    check("shape tag: all tags stripped from speech", shapeResult.spokenText == "That is the save button.")
+    check("shape tag: wrong point count is dropped", ShapeTagParser.parseTag("[SHAPE:line:1,2;3,4;5,6:x]") == nil)
+    check("shape tag: curve needs 3 to 16 points", ShapeTagParser.parseTag("[SHAPE:curve:1,2;3,4:x]") == nil
+          && ShapeTagParser.parseTag("[SHAPE:curve:1,2;3,4;5,6:x]") != nil)
+    let shapeDetector = StreamingShapeDetector()
+    check("shape detector: silent until the tag closes",
+          shapeDetector.feed(accumulated: "look [SHAPE:line:1,2;3,4:a").isEmpty)
+    check("shape detector: fires once on close",
+          shapeDetector.feed(accumulated: "look [SHAPE:line:1,2;3,4:a]").count == 1
+          && shapeDetector.feed(accumulated: "look [SHAPE:line:1,2;3,4:a] more").isEmpty)
+    check("segmenter: tag-first line speaks the sentence",
+          SpokenTextSegmenter.speakablePrefix("[SHAPE:circle:1,2;3,4:x] That is the save button.") == "That is the save button.")
+    check("segmenter: holds back an unclosed trailing fragment",
+          SpokenTextSegmenter.speakablePrefix("it is here. [SHAPE:circle:1,") == "it is here. ")
+    check("segmenter: skips mid-text tags",
+          SpokenTextSegmenter.speakablePrefix("a [POINT:1,2:x] b") == "a b")
+    check("pointing tag: spoken text drops SHAPE and HIGHLIGHT",
+          PointingTagParser.parse(from: "ok [SHAPE:line:1,2;3,4] [HIGHLIGHT:1,2,3,4] [POINT:5,6:x]").spokenText == "ok")
+
+    check("pointing label: trimmed and short passes", PointingLabel.bubbleText(from: "  save  button ") == "save button")
+    check("pointing label: none, empty and long are ignored",
+          PointingLabel.bubbleText(from: "none") == nil && PointingLabel.bubbleText(from: "") == nil
+          && PointingLabel.bubbleText(from: "the small gear shaped settings control") == nil)
+
+    let paletteDefault = InkPalette.resolve(preset: .standard, increaseContrast: false,
+                                            differentiateWithoutColor: false, reduceMotion: false)
+    let paletteContrast = InkPalette.resolve(preset: .standard, increaseContrast: true,
+                                             differentiateWithoutColor: true, reduceMotion: true, pointsToPixelsScale: 0.5)
+    check("ink palette: default user ink is white casing, dark casing, yellow core",
+          paletteDefault.userInk.layers.map(\.width) == [10, 7, 4]
+          && paletteDefault.userInk.layers.map(\.alpha) == [1, 1, 1]
+          && abs(paletteDefault.userInk.layers[2].red - 240.0 / 255) < 1e-9)
+    check("ink palette: increase contrast widens, scales with pixels, dashes assistant, shortens the fade",
+          paletteContrast.userInk.layers.map(\.width) == [6.5, 4.5, 2.5]
+          && paletteContrast.assistantDashed && paletteContrast.fade == InkFadeTimings(hold: 1.5, fade: 0.25))
+    check("ink palette: high visibility is dashed whatever the flags",
+          InkPalette.resolve(preset: .highVisibility, increaseContrast: false, differentiateWithoutColor: false,
+                             reduceMotion: false).assistantDashed)
+
+    // --- Ink to the model: routing, grid, turn analysis, prompt, timer ---
+    func inkRoute(_ s: String, ink: Bool = true, vision: Bool = true) -> ConversationRoute {
+        InkRouting.route(transcript: s, context: ctx(vision: vision), hasUsableInk: ink)
+    }
+    check("ink route: a question with ink is a describe turn", inkRoute("what is this") == .screen)
+    check("ink route: ink beats an app keyword", inkRoute("open youtube") == .screen)
+    check("ink route: pointing words still point", inkRoute("where do i click to save") == .screenPoint)
+    check("ink route: click words still click", inkRoute("click the button i circled") == .screenClick)
+    check("ink route: no ink leaves the router alone", inkRoute("open youtube", ink: false) == route("open youtube", ctx()))
+    check("ink route: no vision, no ink route", inkRoute("what is this", vision: false) == route("what is this", ctx(vision: false)))
+
+    let inkGrid = InkAccessibilityGrid.probePoints(in: CGRect(x: 0, y: 0, width: 60, height: 120),
+                                                   extraPoints: [CGPoint(x: 7, y: 8)])
+    check("ink grid: 6x6 cell centres plus the extras",
+          inkGrid.count == 37 && inkGrid[0] == CGPoint(x: 5, y: 10) && inkGrid.last == CGPoint(x: 7, y: 8))
+
+    let inkAbove = ScreenMapping(displayFrame: CGRect(x: 0, y: 982, width: 1512, height: 982),
+                                 displayWidthInPoints: 1512, displayHeightInPoints: 982,
+                                 screenshotWidthInPixels: 1152, screenshotHeightInPixels: 748)
+    check("mapping: CG point for a display above the primary is negative",
+          inkAbove.cgGlobalPoint(forDisplayLocalPoint: .zero, primaryScreenHeight: 982) == CGPoint(x: 0, y: -982))
+
+    let inkTurnMap = ScreenMapping(displayFrame: CGRect(x: 0, y: 0, width: 1000, height: 600),
+                                   displayWidthInPoints: 1000, displayHeightInPoints: 600,
+                                   screenshotWidthInPixels: 500, screenshotHeightInPixels: 300)
+    let inkRing = (0...48).map { step -> InkSample in
+        let angle = 2 * Double.pi * Double(step) / 48
+        return InkSample(point: CGPoint(x: 400 + 80 * cos(angle), y: 300 + 80 * sin(angle)), time: Double(step) * 0.016)
+    }
+    if let inkTurn = InkTurn.analyze(globalSamples: inkRing, mapping: inkTurnMap) {
+        check("ink turn: circle worded and mapped to pixels",
+              inkTurn.gestureSummary == "The user drew 1 mark while speaking: circled an area in the center."
+              && abs(inkTurn.boundsInImagePixels.midX - 200) < 1 && abs(inkTurn.boundsInImagePixels.midY - 150) < 1)
+    } else {
+        check("ink turn: circle analysed", false)
+    }
+    check("ink turn: a jiggle gives no ink",
+          InkTurn.analyze(globalSamples: (0..<6).map { InkSample(point: CGPoint(x: 300 + Double($0 % 2) * 3, y: 300), time: Double($0) * 0.02) },
+                          mapping: inkTurnMap) == nil)
+
+    let inkPrompt = LocalPrompts.inkAddendum(gestureSummary: "The user drew 1 mark while speaking: circled an area in the center.",
+                                             markerColourName: "yellow", hasCloseUp: true,
+                                             accessibilityBlock: "Elements inside the circled area, in reading order:\n- button \"Save\"")
+    check("ink prompt: marker, summary, close-up line and element block",
+          inkPrompt.contains("a yellow marker") && inkPrompt.contains("circled an area in the center")
+          && inkPrompt.contains("second image is a close-up") && inkPrompt.hasSuffix("- button \"Save\""))
+    check("ink prompt: names and links are said to come from the app",
+          inkPrompt.contains("read directly from the app itself"))
+    check("ink prompt: no close-up line on a pointing turn",
+          !LocalPrompts.inkAddendum(gestureSummary: "x", markerColourName: "red", hasCloseUp: false).contains("second image"))
+
+    let inkTimer = TurnTimer()
+    inkTimer.setInk(marks: 2, crop: true)
+    inkTimer.mark(.inkReady)
+    inkTimer.mark(.axReady)
+    let inkTimerLine = inkTimer.snapshot(outcome: "completed").jsonLine()
+    check("turn timer: ink counts and stages are recorded, keys stay allowed",
+          inkTimerLine.contains("\"ink_marks\":2") && inkTimerLine.contains("\"ink_crop\":true")
+          && inkTimerLine.contains("ink_ready") && inkTimerLine.contains("ax_ready")
+          && TurnTimingRecord.allowedJSONKeys.isSuperset(of: ["ink_marks", "ink_crop"]))
+
+    let axOverlay = AccessibilityWindowInfo(pid: 100, bounds: CGRect(x: 0, y: 0, width: 1000, height: 800), layer: 1000)
+    let axApp = AccessibilityWindowInfo(pid: 200, bounds: CGRect(x: 0, y: 0, width: 500, height: 800), layer: 0)
+    check("ax target: our overlay is skipped, the app under it is picked",
+          AccessibilityTargetApp.owningPid(windows: [axOverlay, axApp], at: CGPoint(x: 100, y: 100), excludingPid: 100) == 200)
+    check("ax target: the frontmost app wins when it is not us, the window pick runs when it is",
+          AccessibilityTargetApp.targetPid(frontmostPid: 250, windows: [axApp], at: CGPoint(x: 1, y: 1), ownPid: 100) == 250
+          && AccessibilityTargetApp.targetPid(frontmostPid: 100, windows: [axOverlay, axApp], at: CGPoint(x: 1, y: 1), ownPid: 100) == 200)
+    check("ax target: no window at the point gives nil",
+          AccessibilityTargetApp.owningPid(windows: [axApp], at: CGPoint(x: 900, y: 700), excludingPid: 100) == nil)
+
+    var markSchedule = SpeechMarkScheduler<String>()
+    markSchedule.markClosed("m1", at: 0)
+    let markClip1 = markSchedule.sentenceQueued()
+    markSchedule.markClosed("m2", at: 0.2)
+    let markClip2 = markSchedule.sentenceQueued()
+    markSchedule.clipStarted(id: markClip1, at: 0.5)
+    let markFirst = markSchedule.release(at: 0.5)
+    markSchedule.markClosed("m3", at: 1.0)
+    let markSecondEarly = markSchedule.release(at: 1.2)
+    markSchedule.clipStarted(id: markClip2, audibleIn: 0.18, at: 2.0)
+    check("speech marks: each tag binds to its own sentence and shows when that clip starts",
+          markFirst == ["m1"] && markSecondEarly.isEmpty && markSchedule.release(at: 2.04) == ["m2"])
+    check("speech marks: a tag with no sentence shows after 1.5 s, a cancel drops what waits",
+          markSchedule.release(at: 2.49) == [] && markSchedule.release(at: 2.5) == ["m3"]
+          && { var c = SpeechMarkScheduler<Int>(); c.markClosed(1, at: 0); return c.cancel() == 1 && c.release(at: 9).isEmpty }())
+
+    let drawCtx = ConversationRouter.Context(visionModeSelected: true, screenAvailable: true,
+                                             previousTurnUsedScreen: false, hasConversationHistory: false)
+    func drawRoute(_ words: String, enabled: Bool = true) -> ConversationRoute {
+        DrawingRouting.route(transcript: words, context: drawCtx, hasUsableInk: false, drawingEnabled: enabled)
+    }
+    check("draw route: circle, highlight and show-me-where draw when enabled",
+          drawRoute("circle the save button") == .screenDraw && drawRoute("highlight the total") == .screenDraw
+          && drawRoute("show me where the settings are") == .screenDraw)
+    check("draw route: ordinary words do not trigger", !DrawingIntent.wantsDrawing("what is a bookmark")
+          && !DrawingIntent.wantsDrawing("open the drawer") && !DrawingIntent.wantsDrawing("mark it as read"))
+    check("draw route: a click command wins, an action route is kept",
+          DrawingRouting.route(transcript: "click the button i circled", context: drawCtx, hasUsableInk: true, drawingEnabled: true) == .screenClick
+          && drawRoute("set a timer for 4 minutes and mark it") == .setTimer)
+    check("draw route: disabled changes nothing (highlight still points)",
+          drawRoute("highlight the total", enabled: false) == .screenPoint
+          && drawRoute("circle the save button", enabled: false)
+              == InkRouting.route(transcript: "circle the save button", context: drawCtx, hasUsableInk: false))
+    let drawPrompt = LocalPrompts.screenDrawResponse(imageWidthInPixels: 1152, imageHeightInPixels: 748)
+    check("draw prompt: size, both tag forms, ring rule, spoken parity",
+          drawPrompt.contains("1152x748") && drawPrompt.contains("[SHAPE:") && drawPrompt.contains("[HIGHLIGHT:")
+          && drawPrompt.contains("just outside the thing") && drawPrompt.contains("say what the mark is on"))
+
+    check("draw prompt: the circle grammar is two positions, never sizes",
+          drawPrompt.contains("[SHAPE:circle:cx,cy;ex,ey:label]") && drawPrompt.contains("both pairs are positions, never sizes")
+          && !drawPrompt.contains("rx,ry"))
+    let pointDrawMap = ScreenMapping(displayFrame: CGRect(x: 0, y: 0, width: 2560, height: 1440), displayWidthInPoints: 2560,
+                                     displayHeightInPoints: 1440, screenshotWidthInPixels: 1152, screenshotHeightInPixels: 648)
+    func pointDrawShape(_ plan: PointDrawPlan) -> ShapeTag? {
+        if case .shape(let tag) = plan.drawing { return tag } else { return nil }
+    }
+    let pointDrawCircle = PointThenDraw.plan(kind: .circle, pointInImagePixels: CGPoint(x: 400, y: 300), label: "save button",
+                                             controlFrameInDisplayPoints: nil, mapping: pointDrawMap)
+    check("point then draw: a circle is centred on the point with the default radius, sentence from the label",
+          pointDrawShape(pointDrawCircle)?.kind == .circle
+          && pointDrawShape(pointDrawCircle)?.points == [CGPoint(x: 400, y: 300), CGPoint(x: 430, y: 300)]
+          && pointDrawShape(pointDrawCircle)?.label == "save button"
+          && pointDrawCircle.spokenSentence == "that is the save button, circled.")
+    let pointDrawArrow = PointThenDraw.plan(kind: .arrow, pointInImagePixels: CGPoint(x: 200, y: 300), label: nil,
+                                            controlFrameInDisplayPoints: nil, mapping: pointDrawMap)
+    check("point then draw: the arrow tail goes to the side with more room",
+          pointDrawShape(pointDrawArrow)?.kind == .arrow
+          && pointDrawShape(pointDrawArrow)?.points == [CGPoint(x: 290, y: 300), CGPoint(x: 200, y: 300)])
+    check("point then draw: circle and arrow requests only, flag falls back to the shape tags",
+          DrawingIntent.pointThenDrawKind("circle the save button", pointThenDrawEnabled: true) == .circle
+          && DrawingIntent.pointThenDrawKind("draw an arrow to the gear", pointThenDrawEnabled: true) == .arrow
+          && DrawingIntent.pointThenDrawKind("underline the title", pointThenDrawEnabled: true) == nil
+          && DrawingIntent.pointThenDrawKind("circle the save button", pointThenDrawEnabled: false) == nil)
+    let floorStyle = InkPalette.resolve(preset: .standard, increaseContrast: false, differentiateWithoutColor: false,
+                                        reduceMotion: false, pointsToPixelsScale: 0.45).userInk
+    check("ink floor: the model's copy has a core of at least 3 px at the external display scale",
+          abs((floorStyle.withMinimumCoreWidth(InkTurn.minimumCoreWidthInImagePixels).layers.last?.width ?? 0) - 3) < 1e-9
+          && abs((floorStyle.layers.last?.width ?? 0) - 1.8) < 1e-9)
+
+    let markCircle = OverlayDrawing.shape(kind: .circle, points: [CGPoint(x: 300, y: 200), CGPoint(x: 340, y: 200)])
+    let markGeometry = MarkGeometryBuilder.geometry(for: markCircle)
+    check("mark geometry: a circle is two closed passes, deterministic",
+          markGeometry.passes.count == 2 && markGeometry.passes.allSatisfy { $0.count == 1 && $0[0].isClosed }
+          && markGeometry == MarkGeometryBuilder.geometry(for: markCircle))
+    var markMaxGap = 0.0
+    for (first, second) in zip(markGeometry.passes[0][0].points, markGeometry.passes[1][0].points) {
+        markMaxGap = max(markMaxGap, Double(hypot(first.x - second.x, first.y - second.y)))
+    }
+    check("mark geometry: the second pass is within 1.5 pt of the first", markMaxGap <= MarkGeometryBuilder.maxPassOffset && markMaxGap > 0)
+    let markArrow = MarkGeometryBuilder.arrowhead(tail: CGPoint(x: 0, y: 0), tip: CGPoint(x: 200, y: 0))
+    check("mark geometry: the arrowhead sits on the tip, barbs trail back",
+          markArrow[1] == CGPoint(x: 200, y: 0) && markArrow[0].x < 200 && markArrow[2].x < 200)
+    let markCurve = MarkGeometryBuilder.catmullRom([CGPoint(x: 0, y: 0), CGPoint(x: 50, y: 40), CGPoint(x: 100, y: 0)], samplesPerSegment: 12)
+    check("mark geometry: the curve passes through its points",
+          markCurve.first == CGPoint(x: 0, y: 0) && markCurve.last == CGPoint(x: 100, y: 0)
+          && abs(markCurve[12].x - 50) < 1e-9 && abs(markCurve[12].y - 40) < 1e-9)
+    let markMap = ScreenMapping(displayFrame: CGRect(x: 0, y: 0, width: 500, height: 250), displayWidthInPoints: 500,
+                                displayHeightInPoints: 250, screenshotWidthInPixels: 1000, screenshotHeightInPixels: 500)
+    check("mark geometry: a tag maps from screenshot pixels to overlay points",
+          ShapeTagParser.parseTag("[SHAPE:line:600,300;800,400]").map { MarkGeometryBuilder.overlayDrawing(from: $0, mapping: markMap) }
+              == .shape(kind: .line, points: [CGPoint(x: 300, y: 150), CGPoint(x: 400, y: 200)]))
+    let markTimer = TurnTimer()
+    markTimer.mark(.firstMark)
+    markTimer.setMarks(2)
+    let markTimerLine = markTimer.snapshot(outcome: "completed").jsonLine()
+    check("turn timer: first_mark stage and marks count, key stays allowed",
+          markTimerLine.contains("first_mark") && markTimerLine.contains("\"marks\":2")
+          && TurnTimingRecord.allowedJSONKeys.contains("marks"))
+
+    check("model roles: grounding needs vision, defaults to the grounding model, others unchanged",
+          ModelRole.grounding.requiredCapability == "vision" && ModelRole.grounding.defaultModel == LocalModels.defaultGroundingModel
+          && ModelRole.chat.requiredCapability == "completion" && ModelRole.vision.defaultModel == LocalModels.defaultVisionModel)
 
     // --- Safety: inference is localhost-only (no cloud) ---
     check("default Ollama endpoint is localhost", LocalModels.defaultOllamaBaseURL.host == "127.0.0.1")

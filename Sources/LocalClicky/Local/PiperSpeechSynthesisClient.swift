@@ -33,9 +33,18 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
 
     /// WAV clips waiting to play, so successive sentences (streamed from the
     /// model) speak back-to-back without overlapping.
-    private var clipQueue: [Data] = []
+    private struct QueuedClip {
+        let wav: Data
+        let id: Int?
+        /// Silence at the front of the clip, so the first word is heard this
+        /// long after the clip starts.
+        let leadInSilenceSeconds: Double
+    }
+    private var clipQueue: [QueuedClip] = []
     private var player: AVAudioPlayer?
     private(set) var isPlaying = false
+    /// Called when a clip queued with an id starts playing (see SpeechSynthesizing).
+    var onClipStart: (@MainActor (SpeechClipStart) -> Void)?
 
     /// Returns nil if the bundled voice can't be found or the model won't load,
     /// so the coordinator can fall back to the Apple voice. (A factory rather
@@ -87,7 +96,7 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
 
     // MARK: - SpeechSynthesizing
 
-    func speakText(_ text: String) async throws {
+    func speakText(_ text: String, clipID: Int?) async throws {
         try Task.checkCancellation()
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -105,7 +114,7 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
             throw PiperError.synthesisFailed
         }
         try Task.checkCancellation()
-        guard enqueue(wav) else {
+        guard enqueue(QueuedClip(wav: wav, id: clipID, leadInSilenceSeconds: leadInSilenceSeconds)) else {
             throw PiperError.playbackFailed
         }
     }
@@ -195,8 +204,8 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
 
     // MARK: - Playback queue
 
-    private func enqueue(_ wav: Data) -> Bool {
-        clipQueue.append(wav)
+    private func enqueue(_ clip: QueuedClip) -> Bool {
+        clipQueue.append(clip)
         isPlaying = true
         startNextIfIdle()
         return true
@@ -217,9 +226,9 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
             isPlaying = false
             return
         }
-        let wav = clipQueue.removeFirst()
+        let clip = clipQueue.removeFirst()
         do {
-            let newPlayer = try AVAudioPlayer(data: wav)
+            let newPlayer = try AVAudioPlayer(data: clip.wav)
             newPlayer.delegate = self
             newPlayer.prepareToPlay()
             player = newPlayer
@@ -227,7 +236,14 @@ final class PiperSpeechSynthesisClient: NSObject, SpeechSynthesizing, AVAudioPla
             // If playback can't actually start, the finish-delegate never fires,
             // so isPlaying would stay true forever — wedging the transient-hide
             // loop and anything that waits on isPlaying. Drop the clip and move on.
-            if !newPlayer.play() {
+            if newPlayer.play() {
+                // The clip is playing now. Whoever queued it with an id hears
+                // about it here, once, and never for a clip dropped above or
+                // below.
+                if let id = clip.id {
+                    onClipStart?(SpeechClipStart(id: id, audibleIn: clip.leadInSilenceSeconds))
+                }
+            } else {
                 player = nil
                 startNextIfIdle()
             }

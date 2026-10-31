@@ -36,16 +36,37 @@ final class StreamingSpeechProgress: @unchecked Sendable {
     }
 }
 
+/// A speech clip began playing.
+struct SpeechClipStart: Sendable, Equatable {
+    /// The id the caller gave `speakText(_:clipID:)`.
+    let id: Int
+    /// How long after this notification the first word is heard: the silence
+    /// the client put in front of the clip, or 0 when it has none. Lets the
+    /// caller time something to land just before the words.
+    let audibleIn: TimeInterval
+}
+
 /// Anything that can speak text aloud, with a pollable `isPlaying` flag (the
 /// transient-cursor hide loop relies on it flipping back to false when speech
 /// ends).
 @MainActor
 protocol SpeechSynthesizing: AnyObject {
     var isPlaying: Bool { get }
+    /// Called on the main actor when a clip that was queued with a `clipID`
+    /// starts playing. Not called for clips queued without an id, and never for
+    /// a clip that never plays (empty text, failed synthesis, a stop).
+    var onClipStart: (@MainActor (SpeechClipStart) -> Void)? { get set }
     /// Speaks `text`. May be called repeatedly to queue successive sentences;
     /// clips play back in order. Returns once the clip is synthesized and queued.
-    func speakText(_ text: String) async throws
+    /// `clipID` names the clip in `onClipStart`.
+    func speakText(_ text: String, clipID: Int?) async throws
     func stopPlayback()
+}
+
+extension SpeechSynthesizing {
+    func speakText(_ text: String) async throws {
+        try await speakText(text, clipID: nil)
+    }
 }
 
 /// Prefers the neural Piper voice; falls back to Apple's synthesizer. The
@@ -78,10 +99,19 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
 
     var isPlaying: Bool { (neural?.isPlaying ?? false) || fallback.isPlaying }
 
-    func speakText(_ text: String) async throws {
+    /// Forwarded to both voices, so a clip's start is reported whichever one
+    /// speaks it.
+    var onClipStart: (@MainActor (SpeechClipStart) -> Void)? {
+        didSet {
+            neural?.onClipStart = onClipStart
+            fallback.onClipStart = onClipStart
+        }
+    }
+
+    func speakText(_ text: String, clipID: Int?) async throws {
         if let neural, !hasDisabledNeuralVoice {
             do {
-                try await speakWithNeuralTimeout(neural, text: text)
+                try await speakWithNeuralTimeout(neural, text: text, clipID: clipID)
                 consecutiveNeuralFailures = 0
                 return
             } catch is CancellationError {
@@ -108,7 +138,7 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
                 await waitForNeuralPlaybackToDrain(maxSeconds: 8)
             }
         }
-        try await fallback.speakText(text)
+        try await fallback.speakText(text, clipID: clipID)
     }
 
     /// Waits (capped) until the neural voice isn't actively playing, so an Apple
@@ -122,7 +152,7 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
         }
     }
 
-    private func speakWithNeuralTimeout(_ neural: PiperSpeechSynthesisClient, text: String) async throws {
+    private func speakWithNeuralTimeout(_ neural: PiperSpeechSynthesisClient, text: String, clipID: Int?) async throws {
         // The timeout budget scales with how much text we're synthesizing and is
         // generous enough to absorb the one-time graph warm-up on the first
         // utterance. Real synthesis runs ~20× faster than real time on Apple
@@ -131,7 +161,7 @@ final class SpeechSynthesisCoordinator: SpeechSynthesizing {
         let timeoutSeconds = min(20.0, 6.0 + Double(text.count) * 0.05)
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
-                try await neural.speakText(text)
+                try await neural.speakText(text, clipID: clipID)
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))

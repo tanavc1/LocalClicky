@@ -78,7 +78,36 @@ public enum LocalModels {
 
     /// Default local Ollama endpoint. Overridable so a user running Ollama on a
     /// non-standard port can point the app at it.
-    public static let defaultOllamaBaseURL = URL(string: "http://127.0.0.1:11434")!
+    ///
+    /// Studio-gateway patch: `LOCALCLICKY_OLLAMA_URL` (env) or the `ollamaBaseURL` default in the
+    /// `com.localclicky.LocalClicky` domain (`defaults write com.localclicky.LocalClicky ollamaBaseURL
+    /// http://127.0.0.1:11435`) overrides the endpoint. Only loopback URLs are honored, so the
+    /// "nothing leaves this Mac" property of the app itself is unchanged.
+    ///
+    /// Lookup order is env, then `UserDefaults.standard`, then the named suite. Standard comes
+    /// before the suite because inside the app `standard` already is the app's own domain, while
+    /// macOS returns nil for a suite named after the process's own bundle id, so the suite lookup
+    /// alone silently ignored the `defaults write`. The suite stays as a last resort so CLI and
+    /// test processes with a different bundle id still see the domain.
+    public static var defaultOllamaBaseURL: URL {
+        resolveOllamaBaseURL(
+            env: ProcessInfo.processInfo.environment["LOCALCLICKY_OLLAMA_URL"],
+            standard: UserDefaults.standard.string(forKey: "ollamaBaseURL"),
+            suite: UserDefaults(suiteName: "com.localclicky.LocalClicky")?.string(forKey: "ollamaBaseURL")
+        )
+    }
+
+    /// Pure resolution behind `defaultOllamaBaseURL`: the first non-nil of env, standard, suite
+    /// wins, then it must be an http loopback URL or the local default is returned.
+    static func resolveOllamaBaseURL(env: String?, standard: String?, suite: String?) -> URL {
+        let fallback = URL(string: "http://127.0.0.1:11434")!
+        let raw = env ?? standard ?? suite
+        guard let raw, let url = URL(string: raw), url.scheme == "http",
+              let host = url.host, host == "127.0.0.1" || host == "localhost" || host == "::1" else {
+            return fallback
+        }
+        return url
+    }
 
     /// Whether a vision model can plausibly return pixel coordinates for pointing.
     /// Ollama doesn't expose a "grounding" capability, so this is a deliberately
@@ -101,12 +130,15 @@ public enum ModelRole: String, CaseIterable, Sendable {
     case chat
     /// The screen vision + pointing model. Needs image input ("vision").
     case vision
+    /// The pointing model: grounds a UI element to pixel coordinates (the blue
+    /// cursor) and draws shapes. Needs image input, like the vision role.
+    case grounding
 
     /// The Ollama capability this role requires a model to advertise.
     public var requiredCapability: String {
         switch self {
         case .chat: return "completion"
-        case .vision: return "vision"
+        case .vision, .grounding: return "vision"
         }
     }
 
@@ -115,6 +147,7 @@ public enum ModelRole: String, CaseIterable, Sendable {
         switch self {
         case .chat: return "Text model"
         case .vision: return "Vision model"
+        case .grounding: return "Pointing model"
         }
     }
 
@@ -123,6 +156,7 @@ public enum ModelRole: String, CaseIterable, Sendable {
         switch self {
         case .chat: return LocalModels.defaultChatModel
         case .vision: return LocalModels.defaultVisionModel
+        case .grounding: return LocalModels.defaultGroundingModel
         }
     }
 }

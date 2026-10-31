@@ -32,7 +32,11 @@ public struct PointingTag: Equatable, Sendable {
 
 public enum PointingTagParser {
     /// Parses (and strips) the pointing tag from a model response.
-    public static func parse(from response: String) -> PointingTag {
+    public static func parse(from rawResponse: String) -> PointingTag {
+        // [SHAPE ...] and [HIGHLIGHT ...] are ink-out tags (ShapeTagParser reads
+        // them); drop them first so they never reach the spoken text. POINT
+        // parsing below sees the same text it always did.
+        let response = ShapeTagParser.stripDrawingTags(from: rawResponse)
         // 1) Prefer an explicit [POINT:...] tag (what we prompt the model for).
         if let tag = parsePointTag(in: response) { return tag }
         // 2) Fall back to a bare bracket box/point like "[932,415,978,436:REC]"

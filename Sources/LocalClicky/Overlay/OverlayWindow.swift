@@ -106,6 +106,11 @@ struct BlueCursorView: View {
     let screenFrame: CGRect
     let isFirstAppearance: Bool
     @ObservedObject var companionManager: CompanionManager
+    /// The live ink trail, shared by every screen's overlay. Observed here so the
+    /// cursor outline follows the resolved style live.
+    @ObservedObject var inkTrail: InkTrailModel
+    /// The assistant's marks (ink out), drawn for this screen only.
+    @ObservedObject var assistantMarks: AssistantMarksModel
 
     @State private var cursorPosition: CGPoint
     @State private var isCursorOnThisScreen: Bool
@@ -114,6 +119,8 @@ struct BlueCursorView: View {
         self.screenFrame = screenFrame
         self.isFirstAppearance = isFirstAppearance
         self.companionManager = companionManager
+        self.inkTrail = companionManager.inkTrail
+        self.assistantMarks = companionManager.assistantMarks
 
         // Seed the cursor position from the current mouse location so the
         // buddy doesn't flash at (0,0) before onAppear fires.
@@ -176,10 +183,37 @@ struct BlueCursorView: View {
         "found it!"
     ]
 
+    /// The blue triangle with its contrast outline: a dark band, then a white
+    /// band, outside the edge. A stroke is centred on the path, so each band is
+    /// drawn at twice its thickness and the fill covers the inner halves.
+    private var cursorTriangle: some View {
+        let outline = inkTrail.style.cursorOutline
+        let innerBand = outline.inner.width
+        let outerBand = outline.outer.width
+        return ZStack {
+            Triangle()
+                .stroke(Color(outline.outer),
+                        style: StrokeStyle(lineWidth: 2 * (innerBand + outerBand), lineJoin: .round))
+            Triangle()
+                .stroke(Color(outline.inner),
+                        style: StrokeStyle(lineWidth: 2 * innerBand, lineJoin: .round))
+            Triangle()
+                .fill(DS.Colors.overlayCursorBlue)
+        }
+    }
+
     var body: some View {
         ZStack {
             // Nearly transparent background (helps with compositing)
             Color.black.opacity(0.001)
+
+            // The user's ink. First in the stack, so the cursor, waveform,
+            // spinner and bubbles are all drawn on top of it.
+            InkTrailLayer(trail: inkTrail, screenFrame: screenFrame)
+
+            // The assistant's own marks (circle, arrow, highlight), also under
+            // the cursor and the bubbles.
+            AssistantMarksLayer(marks: assistantMarks, style: inkTrail.style, screenFrame: screenFrame)
 
             // Welcome speech bubble (first launch only)
             if isCursorOnThisScreen && showWelcome && !welcomeText.isEmpty {
@@ -288,8 +322,7 @@ struct BlueCursorView: View {
             // During cursor following: fast spring animation for snappy tracking.
             // During navigation: NO implicit animation — the frame-by-frame bezier
             // timer controls position directly at 60fps for a smooth arc flight.
-            Triangle()
-                .fill(DS.Colors.overlayCursorBlue)
+            cursorTriangle
                 .frame(width: 16, height: 16)
                 .rotationEffect(.degrees(triangleRotationDegrees))
                 .shadow(color: DS.Colors.overlayCursorBlue, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
@@ -397,6 +430,14 @@ struct BlueCursorView: View {
         timer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { _ in
             let mouseLocation = NSEvent.mouseLocation
             self.isCursorOnThisScreen = self.screenFrame.contains(mouseLocation)
+
+            // Ink rides this poll: no event tap, no mouse monitor. Edges can be
+            // seen by any screen; only the screen holding the pointer samples.
+            self.inkTrail.tick(
+                isShortcutPressed: self.companionManager.globalPushToTalkShortcutMonitor.isShortcutCurrentlyPressed,
+                mouse: mouseLocation,
+                sampleHere: self.isCursorOnThisScreen
+            )
 
             // During forward flight or pointing, the buddy is NOT interrupted by
             // mouse movement — it completes its full animation and return flight.
@@ -556,6 +597,7 @@ struct BlueCursorView: View {
     /// scale-in entrance and variable-speed character streaming.
     private func startPointingAtElement() {
         buddyNavigationMode = .pointingAtTarget
+        companionManager.noteCursorArrival()
 
         // Rotate back to default pointer angle now that we've arrived
         triangleRotationDegrees = -35.0

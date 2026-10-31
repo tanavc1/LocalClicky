@@ -76,6 +76,34 @@ public enum LocalPrompts {
         """
     }
 
+    /// Prompt for a *drawing* turn (route `.screenDraw`), run on the grounding
+    /// model. The reply is 1 to 3 beat lines: a tag that draws, then one short
+    /// spoken sentence that says what the tag marks (the marks are visual only,
+    /// so the sentence carries the same information for someone who cannot see
+    /// them). Coordinates are pixels of the screenshot the model is given.
+    public static func screenDrawResponse(imageWidthInPixels: Int, imageHeightInPixels: Int) -> String {
+        """
+        you are localclicky. the user asked you to mark something on their screen. the screenshot is \(imageWidthInPixels)x\(imageHeightInPixels) pixels, origin top-left, x to the right, y down, and every number you write is an integer pixel in that image.
+
+        you draw by writing tags. reply in 1 to 3 lines. each line is one tag, then one short lowercase spoken sentence about that mark. say what the mark is on, by name, because the user may not be looking. no emojis, no markdown, no lists.
+
+        tags:
+        [SHAPE:circle:cx,cy;ex,ey:label] a ring. cx,cy is the centre. ex,ey is a point on the ring, directly right of the centre. both pairs are positions, never sizes. keep the ring just outside the thing, never through it.
+        [SHAPE:arrow:x1,y1;x2,y2:label] an arrow from its tail to its tip. the tip touches the target.
+        [SHAPE:line:x1,y1;x2,y2:label] a straight stroke, for example an underline along the bottom of a word.
+        [SHAPE:curve:x1,y1;x2,y2;x3,y3:label] a smooth path through 3 to 8 points.
+        [SHAPE:polygon:x1,y1;x2,y2;x3,y3:label] a closed outline through 3 to 8 corners.
+        [HIGHLIGHT:x1,y1,x2,y2:label] a box from the top-left corner to the bottom-right corner, around a whole control, a line of text or a region.
+        the label is 1 to 3 words naming what is marked.
+
+        use as few marks as the request needs, usually one. if the thing is not on the screen, say so in one sentence and write no tag. only if they also ask where to click, add one [POINT:x,y:label] after the last line.
+
+        example:
+        [SHAPE:circle:640,210;690,210:save button] that is the save button, circled.
+        [HIGHLIGHT:100,400,600,430:error message] and this line is the error message.
+        """
+    }
+
     /// Screen *describe/answer* prompt for the default vision model (Moondream),
     /// used when the user asks about what's on screen but isn't asking where to
     /// click. Deliberately has **no** pointing instructions: Moondream is strong
@@ -96,6 +124,83 @@ public enum LocalPrompts {
         - if it's a follow-up and the screen isn't relevant, just answer from the conversation.
         - never say "simply" or "just". do not output coordinates or any bracketed tags.
         """
+    }
+
+    /// Extra text for a turn where the user drew on the screen while speaking.
+    /// It goes after the user's words, so the system prompts above stay exactly
+    /// as they are on every turn without ink. One sentence says the user marked
+    /// the area and to answer about it; then the gesture summary; then, on a
+    /// describe turn that carries the close-up, a line about the second image;
+    /// then, when there is an Accessibility block for the marked area, one sentence saying its names and links came straight from the app, and the block;
+    /// last, when `markKind` is given, the mark line (describe turns, which pass no Accessibility block).
+    public static func inkAddendum(gestureSummary: String,
+                                   markerColourName: String,
+                                   hasCloseUp: Bool,
+                                   accessibilityBlock: String = "",
+                                   markKind: InkMarkKind? = nil) -> String {
+        var parts = ["the user drew on the screen with a \(markerColourName) marker while speaking, so they are marking an area on purpose. answer about the marked area."]
+        let summary = gestureSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !summary.isEmpty { parts.append(summary) }
+        if hasCloseUp { parts.append("the second image is a close-up of the marked area.") }
+        let elements = accessibilityBlock.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !elements.isEmpty {
+            parts.append("the names and links in this list were read directly from the app itself, so use them exactly as written rather than reading them off the image.")
+            parts.append(elements)
+        }
+        if let markKind { parts.append(inkMarkLine(kind: markKind, hasCloseUp: hasCloseUp)) }
+        return parts.joined(separator: "\n")
+    }
+
+    /// The system prompt of a describe turn that carries ink. It replaces
+    /// `screenDescribe` and takes no environment line, byte for byte the eval's
+    /// ink prompt (clicky-eval ce_ink.INK_SYSTEM, arm A1FPC).
+    public static let inkDescribe = "you are localclicky. the user marked one thing on their screen. say what that one thing is. begin with \"that's the <name>\". name the exact control, icon, row or word that is marked; use its label if it has one. do not describe the app, the window or anything else on screen. your reply is read aloud: one or two short sentences, all lowercase, no emojis, no markdown, no lists."
+
+    /// Appended after the user's words on a pointing or click turn whose words name a window or an app
+    /// (PointingTarget.namesWindow). The point prompt speaks of one control; this says the target is the whole thing.
+    public static let windowTargetLine = "the thing to point at is a whole window or app, not one control inside it. point at the middle of that window's title bar, or at the middle of the window when its title bar is not visible."
+
+    /// The system prompt of an ink turn whose words ask more than the name (InkTurnPolicy, kind .explain).
+    /// Not a measured request: the naming turn keeps the eval's A1FPC text byte for byte, this one answers the question.
+    public static let inkExplain = "you are localclicky. the user marked an area on their screen and asked a question about it. answer that question from what is inside the marked area. read the exact words, names, numbers and values written there and say them as they appear, numbers as digits. do not describe the app, the window or anything outside the marked area unless the question needs it. if the marked area does not hold the answer, say what it does show instead of guessing. your reply is read aloud: two to four short sentences, all lowercase, no emojis, no markdown, no lists, no coordinates and no bracketed tags."
+
+    /// The system prompt of a freeform sketch turn (route `.screenSketch`, a figure the app has no template for).
+    /// The frame is 0 to 1000 on both axes: the gateway rescales it to the screenshot, and the app reads the tags as
+    /// pixels. The screenshot rides along only so the gateway knows the image size. Pinned by sha256 like the eval's check.
+    /// Assumes the grounding model is `studio:clicky` behind clicky-gateway (norm1000 plus its rescaler): any other
+    /// grounding-capable model reads these tags as pixels and the figure lands as a thumbnail in the top left corner.
+    public static let screenSketchResponse = """
+        you are localclicky. the user asked you to draw a simple figure on their screen. this is a drawing, not a mark: do not describe, mark or point at anything in the screenshot. it is attached only so you know what the screen looks like.
+
+        you draw by writing tags. every coordinate is on a 0 to 1000 grid in both directions whatever the screen size: 0,0 is the top left corner, 1000,1000 the bottom right, x to the right, y down. keep the whole figure between 200 and 800 on both axes, in the middle of the screen.
+
+        tags, one per line:
+        [SHAPE:line:x1,y1;x2,y2] a straight stroke.
+        [SHAPE:arrow:x1,y1;x2,y2] an arrow from its tail to its tip.
+        [SHAPE:circle:cx,cy;ex,ey] a ring. cx,cy is the centre and ex,ey is a point on the ring directly right of the centre. both pairs are positions, never sizes.
+        [SHAPE:curve:x1,y1;x2,y2;x3,y3] a smooth path through 3 to 8 points.
+        [SHAPE:polygon:x1,y1;x2,y2;x3,y3] a closed outline through 3 to 8 corners.
+
+        use at most 8 tags and no labels. write the tags first, one per line, then one short lowercase sentence that says what you drew and where, for someone who cannot see it. no emojis, no markdown, no lists, no other text.
+
+        example, for "draw a house":
+        [SHAPE:polygon:350,500;650,500;650,750;350,750]
+        [SHAPE:polygon:330,500;500,350;670,500]
+        [SHAPE:polygon:460,620;540,620;540,750;460,750]
+        here is a small house in the middle of your screen, with a square body, a pointed roof and a door.
+        """
+
+    /// One line about where the marked thing is, by the kind of the mark, last
+    /// in the addendum (ce_ink.MARK_LINES and mark_line). The scribble line
+    /// points at the clean close-up only when one is sent.
+    public static func inkMarkLine(kind: InkMarkKind, hasCloseUp: Bool) -> String {
+        switch kind {
+        case .circle: return "the marked thing is inside the ring."
+        case .line: return "the marked thing is directly above the line."
+        case .scribble:
+            return "the marked thing is under the scribble, so it may be hidden in the first image"
+                + (hasCloseUp ? "; the second image shows the same area without the ink." : ".")
+        }
     }
 
     /// Text-only prompt for the fast chat model, used when there's no useful

@@ -8,8 +8,8 @@
 //  while the rest is still being generated.
 //
 //  Two things make it safe:
-//   1. We never speak past the start of a pointing tag (`[POINT:…]`), so the tag
-//      is never read aloud.
+//   1. We never read a tag aloud: `[POINT:…]`, `[SHAPE:…]` and `[HIGHLIGHT:…]`
+//      are skipped once complete, and speech holds at an unclosed "[".
 //   2. During streaming we only treat a sentence as "complete" when its
 //      terminator is followed by whitespace. That avoids splitting decimals like
 //      "3.5" and avoids speaking a half-finished sentence at the streaming edge;
@@ -20,14 +20,32 @@ import Foundation
 
 public enum SpokenTextSegmenter {
 
-    /// The portion of a (possibly partial) response that is safe to speak:
-    /// everything before a pointing tag begins. The spoken-answer prompt forbids
-    /// markdown/code, so a "[" only ever introduces a tag.
+    /// The portion of a (possibly partial) response that is safe to speak.
+    /// Complete `[SHAPE ...]`, `[HIGHLIGHT ...]` and `[POINT ...]` tags are
+    /// skipped wherever they sit, so a tag-first line like
+    /// "[SHAPE:circle:...:x] That is the save button." speaks the sentence.
+    /// Speech stops at any other "[" (an unclosed tag still streaming in, or a
+    /// bracket that is not one of our tags), because the spoken-answer prompt
+    /// forbids markdown/code and a "[" otherwise only introduces a tag.
+    /// Once text is returned, more streamed text only ever extends it.
     public static func speakablePrefix(_ text: String) -> String {
-        if let bracket = text.firstIndex(of: "[") {
-            return String(text[..<bracket])
+        var spoken = ""
+        var cursor = text.startIndex
+        while let bracket = text[cursor...].firstIndex(of: "[") {
+            spoken += text[cursor..<bracket]
+            guard let tag = text.range(of: ShapeTagParser.anyTagPattern,
+                                       options: [.regularExpression, .caseInsensitive, .anchored],
+                                       range: bracket..<text.endIndex) else {
+                return spoken
+            }
+            cursor = tag.upperBound
+            // Drop the gap a removed tag leaves, so no double space or stray
+            // leading space reaches the speaker.
+            if spoken.isEmpty || spoken.last?.isWhitespace == true {
+                while cursor < text.endIndex, text[cursor].isWhitespace { cursor = text.index(after: cursor) }
+            }
         }
-        return text
+        return spoken + text[cursor...]
     }
 
     /// Given the speakable text so far and how many characters were already

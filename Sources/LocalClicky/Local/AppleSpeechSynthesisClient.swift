@@ -22,6 +22,11 @@ final class AppleSpeechSynthesisClient: NSObject, SpeechSynthesizing {
     /// false when playback ends.
     private(set) var isPlaying = false
 
+    /// Called when an utterance queued with an id starts speaking (see SpeechSynthesizing).
+    var onClipStart: (@MainActor (SpeechClipStart) -> Void)?
+    /// Clip ids of utterances that have not started yet, keyed by the utterance.
+    private var pendingClipIDs: [ObjectIdentifier: Int] = [:]
+
     override init() {
         super.init()
         speechSynthesizer.delegate = self
@@ -30,7 +35,7 @@ final class AppleSpeechSynthesisClient: NSObject, SpeechSynthesizing {
     /// Speaks `text` with the best installed US-English voice. Returns as soon as
     /// speech is queued (the "returns when playback starts" contract the rest of
     /// the app relies on for state transitions).
-    func speakText(_ text: String) async throws {
+    func speakText(_ text: String, clipID: Int?) async throws {
         try Task.checkCancellation()
 
         // Nothing to say — return without arming isPlaying, or the empty
@@ -41,12 +46,14 @@ final class AppleSpeechSynthesisClient: NSObject, SpeechSynthesizing {
         let utterance = AVSpeechUtterance(string: trimmed)
         utterance.voice = Self.bestAvailableEnglishVoice()
 
+        if let clipID { pendingClipIDs[ObjectIdentifier(utterance)] = clipID }
         isPlaying = true
         speechSynthesizer.speak(utterance)
     }
 
     func stopPlayback() {
         speechSynthesizer.stopSpeaking(at: .immediate)
+        pendingClipIDs.removeAll()
         isPlaying = false
     }
 
@@ -65,11 +72,22 @@ final class AppleSpeechSynthesisClient: NSObject, SpeechSynthesizing {
 extension AppleSpeechSynthesisClient: AVSpeechSynthesizerDelegate {
     // Delegate callbacks arrive on an arbitrary queue — hop to the main actor
     // before touching isPlaying.
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        let key = ObjectIdentifier(utterance)
+        Task { @MainActor in
+            // Spoken text starts right away, so there is no silence to report.
+            guard let id = self.pendingClipIDs.removeValue(forKey: key) else { return }
+            self.onClipStart?(SpeechClipStart(id: id, audibleIn: 0))
+        }
+    }
+
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.isPlaying = false }
+        let key = ObjectIdentifier(utterance)
+        Task { @MainActor in self.pendingClipIDs.removeValue(forKey: key); self.isPlaying = false }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        Task { @MainActor in self.isPlaying = false }
+        let key = ObjectIdentifier(utterance)
+        Task { @MainActor in self.pendingClipIDs.removeValue(forKey: key); self.isPlaying = false }
     }
 }

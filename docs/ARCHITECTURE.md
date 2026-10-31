@@ -71,6 +71,105 @@ is HTTP to a local Ollama server on `127.0.0.1:11434`.
 For an **action** (step 4), the turn skips inference entirely and is resolved by
 deterministic rules — see [Actions](#actions).
 
+### Ink, window pointing and sketches
+
+Three refinements ride on the routes above; each decision is a pure function in
+`LocalBrainKit` so it is unit‑tested without the app.
+
+- **Marked area, naming vs explain** (`InkTurnPolicy`, `InkQuestion`): a describe
+  turn with ink is *naming* when the words are only "what is this?" and its narrow
+  variants, otherwise *explain*. Naming is the measured request (`inkDescribe`, the
+  `X-Clicky-Turn: ink-describe` header, no Accessibility block, no history).
+  Explain answers the question from inside the marked area (`inkExplain`,
+  `X-Clicky-Turn: ink-explain`, with the Accessibility block and history), so
+  "go into detail" quotes the numbers instead of repeating the name.
+- **Pointing routing** (`ConversationRouter.wantsPointing`): besides the "where is the"
+  phrases, `wantsWhereObjectIs` catches "where the X is/are" (object before the verb)
+  and "find out / find / tell me / show where the ...". It leaves alone questions about
+  places in the world ("nearest", "closest", "nearby", "near me", ...) and live-data
+  questions (`wantsWebReach`). A pointing hit skips the web, timer, app and browser
+  routes like every pointing question, and acts only with vision mode and the screen on.
+  `Context.previousTurnWasPointing` lets a bare follow-up (`PointingFollowUp.isBareFollowUp`:
+  "again", "that one", "show me again") be a pointing turn.
+- **Window pointing** (`PointingTarget`): a pointing or click request that names a
+  window or app (the article is optional) and no control gets
+  `LocalPrompts.windowTargetLine` after the user's words; the point system prompt is
+  unchanged. The control nouns include bar, box, input, composer, text field, search
+  bar and sidebar (so "the chat window bar" and "menu bar" are control requests).
+  "Title bar" is the exception: it is a window cue, so "point at the title bar of the
+  chat window" gets the window line and the window snap. Grounding turns (point, click, draw) send no history.
+- **Follow-up object** (`PointingFollowUp`): the app keeps the noun phrase of the last
+  pointing or click request. A pointing turn with no object of its own gets it put into
+  the words sent to the model ("point out to me again" becomes "point out the chat
+  window"), and into the window-line decision. History is still not restored on a
+  grounding turn. A new object replaces the stored one.
+- **Snap** (`PointSnap` in `LocalBrainKit`, `PointSnapper` in the app): after the model's
+  point, and before the cursor flies, the point is moved onto the real window or control.
+  Every point and frame is in Core Graphics global points (top-left of the primary
+  display, y down), the space of Accessibility frames and window bounds. The chain is
+  model norm1000 point, rescaled by the gateway to screenshot pixels, then
+  `ScreenMapping.displayLocalPoint(forImagePoint:)`, then `cgGlobalPoint(...)`; the
+  snapped point returns through `imagePoint(forCGGlobalPoint:)`. A window request goes
+  to the title bar centre (top edge plus 14 pt, never inside the 30 pt menu bar strip)
+  of the window picked in this order, from the window server's layer-0 windows with
+  our own, the menu bar and the Dock left out: (a) one whose title or app name matches
+  the requested object (the substituted or the words' own, "window", "app" and "title
+  bar" dropped) or the model's label, by `labelScore`, even when it does not contain
+  the point; (b) for a point in the top 30 pt of the display, the frontmost window;
+  (c) the topmost window that contains the point; (d) the nearest window, within
+  60 pt; (e) else the model's point stays (a Dock icon of an app with no window).
+  A control request keeps the Accessibility
+  element under the point when its label matches the model's label (token overlap
+  at least 0.5, `PointSnap.labelScore`), else the best match within
+  `PointSnap.searchRadius` (120 pt), else the model's point. A label is an element's
+  title or description, never its value (what a text field holds is typed content, so
+  it is never matched or logged). Containers (AXWindow, AXSheet, AXGroup, AXScrollArea,
+  AXSplitGroup, AXWebArea, AXToolbar, AXLayoutArea, AXApplication) and elements larger
+  than 400 x 300 pt are never candidates; among those holding the point the smallest
+  frame wins, then the best score. The Accessibility reads
+  share `PointSnap.budgetSeconds` (0.15 s). Early and final cursor dispatch both snap
+  (the timing marks `tag_parsed` before the snap; a stream that ends during the early
+  snap reuses its result); a click turn clicks where the cursor went. The primary
+  screen height is read on the main actor and passed in. Temperature and screenshot size are unchanged.
+- **Sketches** (`DrawingRouting` → `.screenSketch`, only with drawing on):
+  `SketchIntent.parse` returns a `SketchRequest` (figure, `SketchAnchor`, `SketchSize`,
+  board) for words that ask for a figure that marks nothing; it is tested before the
+  mark patterns and returns nil when the words name a target ("around the error",
+  "it"). draw, sketch and doodle also reach a freeform figure; put, place, make, show me,
+  give me, add and create reach a figure only when the whole object is a `named` figure
+  (the name, then at most a board word, a placement, a size or a tic tac toe move), so
+  "show me the star wars trailer" and "show me the box score" are not sketches.
+  Tic tac toe moves ("x in the center", "an o top left") are read first, before the
+  placement patterns strip their region words; "empty", "blank", "nothing in it" force an
+  empty board, and only "game in progress" or "some moves" bring back
+  `SketchTemplate.demoBoard`. The placement is one of nine regions (a region word needs
+  a preposition, a corner or side word, or the two-word form, so "a right arrow" is not a
+  placement) plus a size (small 0.6, large 1.5).
+  `SketchTemplate.plan` composes tic tac toe, box, line, arrow, circle, triangle, star,
+  smiley, cross and check in screenshot pixels with no model call, inside that region with
+  an edge margin, and the one sentence it speaks names the figure, the real place
+  ("in the bottom left of your screen") and every tic tac toe move (or "empty") for
+  anyone who cannot see the overlay. Freeform keeps the middle and the usual size: the
+  prompt has no placement. A freeform sketch with tags but no sentence speaks
+  `SketchLimits.drawnSentence`. Any other figure is a freeform sketch: the grounding model
+  writes up to `SketchLimits.maxTags` tags with `screenSketchResponse` (0 to 1000
+  frame, rescaled by the gateway), and `SketchLimits.freeformEnabled` turns that path
+  off with one line. A sketch holds `SketchTiming.holdSeconds` (10 s) after its
+  speech instead of the 1.5 s of a mark; a key press or "clear that" (`.clearMarks`)
+  ends it.
+- **Clear** (`ClearMarksIntent`): "clear/erase/wipe/remove/get rid of/undo" plus a drawing
+  word, a tic tac toe name (any speech-to-text spelling), "the board", "the grid", or
+  "the/that/your" plus any template figure name. A bare "that" counts only after clear,
+  erase or wipe, so "undo that" after a click turn undoes nothing that was drawn. Clear
+  is routed before the base route. The key press clears the marks before the words are
+  heard, so `CompanionManager` remembers whether marks were showing at the press
+  (`marksShownAtPress`); with none it speaks "nothing is drawn right now." and the turn
+  ends there, never falling through to chat.
+- **History note** (`SketchHistory.note`): a sketch turn records "(drew a tic tac toe
+  board)" in the conversation history instead of its sentence, for template and freeform
+  turns alike, so a later chat turn has nothing to recite. `lastSpokenAnswer` keeps the
+  real sentence for "copy your answer".
+
 ## Choosing your models
 
 The defaults (`llama3.2:3b` text, `qwen2.5vl:3b` vision) are tuned for a 16 GB Mac,

@@ -20,6 +20,7 @@ enum ModelPreferences {
     private static let chatKey = "localClicky.chatModelName"
     private static let visionKey = "localClicky.visionModelName"
     private static let groundingKey = "localClicky.groundingModelName"
+    private static let drawingKey = "drawingEnabled"
 
     static var chatModel: String {
         get { UserDefaults.standard.string(forKey: chatKey) ?? LocalModels.defaultChatModel }
@@ -38,10 +39,19 @@ enum ModelPreferences {
         set { UserDefaults.standard.set(newValue, forKey: groundingKey) }
     }
 
+    /// Whether Clicky may draw shapes on the screen (circle, outline, highlight).
+    /// A beta: off until the shape evaluation passes, so a fresh install never
+    /// changes how a turn routes.
+    static var drawingEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: drawingKey) }
+        set { UserDefaults.standard.set(newValue, forKey: drawingKey) }
+    }
+
     static func model(for role: ModelRole) -> String {
         switch role {
         case .chat: return chatModel
         case .vision: return visionModel
+        case .grounding: return groundingModel
         }
     }
 
@@ -49,6 +59,7 @@ enum ModelPreferences {
         switch role {
         case .chat: chatModel = name
         case .vision: visionModel = name
+        case .grounding: groundingModel = name
         }
     }
 

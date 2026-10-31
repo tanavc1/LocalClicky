@@ -146,6 +146,54 @@ scripts/release.sh            # build + DMG + publish the GitHub Release (mainta
   export?"*, *"explain this error."*
 - **Ask anything else** (no screenshot needed): *"what's 12 times 8?"*, *"write me
   a haiku about tabs"*, follow-ups like *"now add two to that."*
+- **Mark the screen and ask** (hold the keys and draw a circle, a line or a scribble
+  on the thing while you speak): *"what is this?"* names it ("that's the ..."), one
+  short answer. Any other question about the marked area is read from inside it:
+  *"go into detail"*, *"what does this say"*, *"how many lines changed here"* quote
+  the exact words and numbers, in two to four sentences.
+- **Find a window or an app:** *"point out where the chat window is"*, *"find out
+  where the chat window is"*, *"point at the mail app"*, *"point out claude window"*
+  (the article is optional) fly the cursor to the middle of that window's title bar.
+  After the model answers, the app moves the point onto the real thing: for a window
+  request, the title bar of the window whose title or app name matches what you asked
+  for, else (for a pick on the menu bar) the frontmost window, else the window that holds
+  the point, else the nearest one within 60 points; with none of those the point stays,
+  so a Dock icon of an app with no window is left alone. For a control request, the
+  Accessibility element under the point if its name matches what the model said (never
+  a text field's contents, never a container or anything bigger than 400 by 300 points),
+  else the best match within 120 points, else the point stays. This adds at most about
+  150 ms. *"The chat window bar"* (also box, input, composer, search bar, sidebar) asks
+  for the control, not the window; *"the title bar of the chat window"* is a window
+  request, while *"the menu bar"* is a control. Each pointing request is its own turn: it does not
+  carry earlier answers along, but a follow-up with no object of its own (*"point out
+  to me again"*, *"point to it"*, *"show me again"*, or a bare *"again"* or *"that
+  one"* right after a pointing turn) reuses the object of the last request.
+- **Ask it to draw** (turn on **Let Clicky draw (beta)** in the panel): *"draw tic tac
+  toe on the screen"* puts an empty board in the middle of the screen and says so out
+  loud. Say the moves to get them drawn (*"with an x in the center and an o in the top
+  left"*, *"x top right and o bottom left"*); *"a game in progress"* or *"with some
+  moves"* brings back the old demo board. It also draws a box, line, arrow, circle,
+  triangle, star, smiley, cross or check mark (*"draw a smiley face"*); anything else
+  (*"draw a house"*) is drawn by the grounding model, at most eight strokes. Besides
+  draw, sketch and doodle, the verbs put, place, make, show me, give me, add and
+  create work when what follows is just one of those figures, with at most a board word,
+  a placement, a size or a move (*"put a tic tac toe on the bottom left of my screen"*);
+  *"make a note"*, *"add a reminder"*, *"show me the box score"* and *"show me the star
+  wars trailer"* are never a drawing.
+  Placement and size are read from the words: one of nine regions (top left, top, top
+  right, left, middle, right, bottom left, bottom, bottom right, with corner, upper,
+  lower and centre/center accepted) and small or big, kept fully on screen, and the
+  spoken sentence names the real place ("in the bottom left of your screen"). Placement
+  and size apply to the app's own figures only; a freeform drawing stays in the middle.
+  The figure stays 10 seconds after it finishes speaking. Say *"clear that"*, *"clear
+  the tic tac toe"* (any spelling speech to text gives it: *"tictac"*, *"tic-tac-toe"*),
+  *"clear the board"* or *"erase the star"* (any figure name) to take it down, or press
+  the keys again. A clear after the 10 seconds have passed says *"nothing is drawn right
+  now."* and does not turn into a chat question. A drawing turn is recorded in the
+  conversation as a short note such as "(drew a star)", never as its spoken sentence,
+  so a later chat turn cannot recite a drawing that is gone. Words that point at
+  something on the screen (*"draw a box around the error"*, *"circle the save button"*)
+  still mark that thing instead.
 - **Get an answer as text** beside the cursor: *"give me Martin Luther King's
   birthday in text"*, *"give text."* — a tight, honest answer in the blue bubble.
 - **Look something up online** (the one opt-in internet feature): *"what's the
@@ -160,6 +208,21 @@ scripts/release.sh            # build + DMG + publish the GitHub Release (mainta
 On the **very first launch**, LocalClicky introduces itself in the blue text
 beside your cursor (how to activate it), then cracks one quick, screen-aware joke
 about whatever you're doing — and that's the whole "onboarding." No video, no music.
+
+## Temporary app debug log
+
+TEMP, removed at project end. While the flag file `~/.clicky-gateway/debug.on` exists
+(the same flag the gateway's logger uses, so `clicky-gateway debug off` turns both
+off), the app appends one JSON line per event to `~/.clicky-gateway/debug-app-turns.jsonl`
+(mode 0600): sketch template turns (transcript, route, figure, anchor, size, board,
+spoken sentence), clear turns (transcript, cleared yes or no) and pointing turns
+(transcript, the object substituted for a follow-up, window line yes or no, the model's
+point in screenshot pixels, its label, snap kind window, ax or none, the snapped point
+in screen points, the matched element title or description, or window title; never a text field's value). It never logs an image
+or screen content beyond that label. To remove it: delete the calls marked
+`// TEMP debug logger (remove at project end)` in
+`Sources/LocalClicky/App/CompanionManager.swift`, then delete
+`Sources/LocalClicky/System/TempAppDebugLog.swift` and this section.
 
 ## Actions (what it can *do*)
 
